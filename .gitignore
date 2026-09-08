@@ -1,0 +1,79 @@
+# Operating system and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+
+# Environment files and local secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+*.egg-info/
+dist/
+build/
+
+# Node.js, Electron, Vite, and TypeScript
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.tsbuildinfo
+.eslintcache
+.vite/
+out/
+release/
+*.asar
+*.dmg
+*.exe
+*.AppImage
+*.deb
+*.rpm
+*.snap
+*.blockmap
+
+# VS Code extension packages
+*.vsix
+.vscode-test/
+
+# Local AI model files
+*.gguf
+*.ggml
+*.bin
+
+# Runtime-generated reports and uploads
+data/reports/*
+data/uploads/*
+!data/reports/.gitkeep
+!data/uploads/.gitkeep
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+tmp/
+temp/
