@@ -128,11 +128,11 @@ export default function App(): JSX.Element {
   }
 
   const canUploadFile = activeTab === 'vision' || activeTab === 'docs'
-  const fileAccept = activeTab === 'vision' ? '.png,.jpg,.webp' : '.json,.md,.ts,.py'
+  const fileAccept = activeTab === 'vision' ? '.png,.jpg,.webp' : '.pdf,.docx,.xlsx,.txt'
 
   const isAllowedFile = (file: File): boolean => {
     const extension = file.name.toLowerCase().split('.').pop()
-    const allowedExtensions = activeTab === 'vision' ? ['png', 'jpg', 'webp'] : ['json', 'md', 'ts', 'py']
+    const allowedExtensions = activeTab === 'vision' ? ['png', 'jpg', 'webp'] : ['pdf', 'docx', 'xlsx', 'txt']
     return canUploadFile && extension !== undefined && allowedExtensions.includes(extension)
   }
 
@@ -147,7 +147,7 @@ export default function App(): JSX.Element {
           ? 'Pilih tab Vision atau Document Parser untuk melampirkan file.'
           : activeTab === 'vision'
             ? 'Mode Vision hanya menerima file PNG, JPG, atau WEBP.'
-            : 'Document Parser hanya menerima file JSON, MD, TS, atau PY.'
+            : 'Document Parser hanya menerima file PDF, DOCX, XLSX, atau TXT.'
       )
       event.target.value = ''
       return
@@ -272,7 +272,7 @@ export default function App(): JSX.Element {
             ? 'Pilih tab Vision atau Document Parser untuk melampirkan file.'
             : activeTab === 'vision'
               ? 'Mode Vision hanya menerima file PNG, JPG, atau WEBP.'
-              : 'Document Parser hanya menerima file JSON, MD, TS, atau PY.'
+              : 'Document Parser hanya menerima file PDF, DOCX, XLSX, atau TXT.'
         )
         return
       }
@@ -280,7 +280,10 @@ export default function App(): JSX.Element {
       const isVisionFile = activeTab === 'vision'
       const formData = new FormData()
       formData.append(isVisionFile ? 'image' : 'file', fileToSend)
-      formData.append('prompt', userText || 'Analisis file ini secara detail.')
+      formData.append(
+        'prompt',
+        userText || (isVisionFile ? 'Jelaskan file gambar ini secara detail.' : 'Tolong analisis isi dokumen ini.')
+      )
 
       setPrompt('')
       removeFile()
@@ -297,7 +300,7 @@ export default function App(): JSX.Element {
       try {
         const targetUrl = isVisionFile
           ? 'http://127.0.0.1:8000/api/vision/analyze'
-          : 'http://127.0.0.1:8000/api/document/parse'
+          : 'http://127.0.0.1:8000/api/agent/dispatch'
         const response = await fetch(targetUrl, {
           method: 'POST',
           body: formData

@@ -8,6 +8,8 @@ from sse_starlette.sse import EventSourceResponse
 import httpx
 import pynvml  # Sekarang sudah menggunakan wrapper resmi nvidia-ml-py
 from agent import execute_agent_pipeline
+from doc_engine import parse_document_file
+from router import detect_pipeline_route, analyze_document_with_r1
 
 app = FastAPI(title="Local Multi-Model Agent Engine")
 
@@ -201,4 +203,42 @@ async def parse_document_endpoint(
         return {"status": "success", "result": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) 
+
+
+@app.post("/api/agent/dispatch")
+async def dispatch_task_endpoint(
+    prompt: str = Form(...),
+    file: UploadFile | None = File(None),
+):
+    filename = file.filename if file else None
+    route = detect_pipeline_route(filename, prompt)
+    print(f"[ROUTER] Terdeteksi rute: {route} untuk file: {filename}")
+
+    try:
+        if route == "DOCUMENT_PIPELINE" and file:
+            file_bytes = await file.read()
+            extracted_text = parse_document_file(filename, file_bytes)
+            analysis_result = analyze_document_with_r1(
+                document_text=extracted_text,
+                user_prompt=prompt or "Berikan ringkasan dan analisis lengkap dokumen ini.",
+            )
+            return {
+                "route": route,
+                "status": "success",
+                "filename": filename,
+                "result": analysis_result,
+            }
+
+        if route == "CODING_PIPELINE":
+            result = execute_agent_pipeline(prompt)
+            return {"route": route, "status": "success", "result": result}
+
+        analysis_result = analyze_document_with_r1(
+            document_text="",
+            user_prompt=prompt,
+        )
+        return {"route": route, "status": "success", "result": analysis_result}
+    except Exception as e:
+        print(f"[DISPATCH ERROR]: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
     
