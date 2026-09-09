@@ -1,8 +1,9 @@
-import { useState, useRef, useEffect, JSX } from 'react'
+import { useState, useRef, useEffect, JSX, ChangeEvent, ClipboardEvent } from 'react'
 import {
   MessageSquare,
   Code2,
   FileText,
+  Image,
   ShieldAlert,
   Send,
   Loader2,
@@ -13,22 +14,31 @@ import {
   User,
   Copy,
   Check,
-  ChevronDown
+  ChevronDown,
+  Paperclip,
+  X
 } from 'lucide-react'
 
 interface Message {
   role: 'user' | 'assistant'
   content: string
+  image?: string
 }
 
 export default function App(): JSX.Element {
-  const [activeTab, setActiveTab] = useState<'chat' | 'code' | 'docs' | 'pentest'>('chat')
+  const [activeTab, setActiveTab] = useState<'chat' | 'code' | 'vision' | 'docs' | 'pentest'>('chat')
   const [prompt, setPrompt] = useState('')
   const [messages, setMessages] = useState<Message[]>([])
   const [loading, setLoading] = useState(false)
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null)
   const [gpuStats, setGpuStats] = useState({ used: 0, total: 6144, percent: 0 })
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const [selectedFile, setSelectedFile] = useState<File | null>(null)
+  const [fileError, setFileError] = useState('')
+  const [imageFile, setImageFile] = useState<File | null>(null)
+  const [imagePreviewUrl, setImagePreviewUrl] = useState<string | null>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const imageUrlsRef = useRef<Set<string>>(new Set())
 
   const tabDetails = {
     chat: {
@@ -46,6 +56,14 @@ export default function App(): JSX.Element {
       icon: Code2,
       color: 'text-cyan-400',
       badge: 'Qwen Coder'
+    },
+    vision: {
+      title: 'Vision Analysis',
+      desc: 'Analisis gambar dengan model vision lokal',
+      target: 'vision',
+      icon: Image,
+      color: 'text-violet-400',
+      badge: 'Vision Engine'
     },
     docs: {
       title: 'Document Parser',
@@ -95,14 +113,213 @@ export default function App(): JSX.Element {
     return () => clearInterval(interval)
   }, [])
 
+  useEffect(() => {
+    const imageUrls = imageUrlsRef.current
+    return () => {
+      imageUrls.forEach(url => URL.revokeObjectURL(url))
+      imageUrls.clear()
+    }
+  }, [])
+
   const copyToClipboard = (text: string, index: number): void => {
     void navigator.clipboard.writeText(text)
     setCopiedIndex(index)
     setTimeout(() => setCopiedIndex(null), 2000)
   }
 
+  const canUploadFile = activeTab === 'vision' || activeTab === 'docs'
+  const fileAccept = activeTab === 'vision' ? '.png,.jpg,.webp' : '.json,.md,.ts,.py'
+
+  const isAllowedFile = (file: File): boolean => {
+    const extension = file.name.toLowerCase().split('.').pop()
+    const allowedExtensions = activeTab === 'vision' ? ['png', 'jpg', 'webp'] : ['json', 'md', 'ts', 'py']
+    return canUploadFile && extension !== undefined && allowedExtensions.includes(extension)
+  }
+
+  const handleFileChange = (event: ChangeEvent<HTMLInputElement>): void => {
+    const file = event.target.files?.[0]
+    if (!file) return
+
+    if (!isAllowedFile(file)) {
+      setSelectedFile(null)
+      setFileError(
+        !canUploadFile
+          ? 'Pilih tab Vision atau Document Parser untuk melampirkan file.'
+          : activeTab === 'vision'
+            ? 'Mode Vision hanya menerima file PNG, JPG, atau WEBP.'
+            : 'Document Parser hanya menerima file JSON, MD, TS, atau PY.'
+      )
+      event.target.value = ''
+      return
+    }
+
+    setFileError('')
+    setSelectedFile(file)
+  }
+
+  const triggerFileSelect = (): void => {
+    fileInputRef.current?.click()
+  }
+
+  const removeFile = (): void => {
+    setSelectedFile(null)
+    setFileError('')
+    if (fileInputRef.current) fileInputRef.current.value = ''
+  }
+
+  const handlePaste = (event: ClipboardEvent<HTMLInputElement>): void => {
+    if (activeTab !== 'vision') return
+
+    const imageItem = Array.from(event.clipboardData.items).find(item =>
+      item.type.startsWith('image/')
+    )
+    if (!imageItem) return
+
+    event.preventDefault()
+    const file = imageItem.getAsFile()
+    if (!file) return
+
+    setSelectedFile(null)
+    if (imagePreviewUrl) {
+      URL.revokeObjectURL(imagePreviewUrl)
+      imageUrlsRef.current.delete(imagePreviewUrl)
+    }
+    setImageFile(file)
+    const previewUrl = URL.createObjectURL(file)
+    imageUrlsRef.current.add(previewUrl)
+    setImagePreviewUrl(previewUrl)
+    setFileError('')
+  }
+
+  const handleRemoveImage = (): void => {
+    if (imagePreviewUrl) {
+      URL.revokeObjectURL(imagePreviewUrl)
+      imageUrlsRef.current.delete(imagePreviewUrl)
+    }
+    setImageFile(null)
+    setImagePreviewUrl(null)
+  }
+
+  const fileToBase64 = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader()
+      reader.readAsDataURL(file)
+      reader.onload = (): void => resolve(reader.result as string)
+      reader.onerror = reject
+    })
+  }
+
   const handleSend = async (): Promise<void> => {
-    if (!prompt.trim() || loading) return
+    if ((!prompt.trim() && !selectedFile && !imageFile) || loading) return
+
+    if (imageFile) {
+      const imageToSend = imageFile
+      const userText = prompt.trim()
+      let base64Image: string
+
+      try {
+        base64Image = await fileToBase64(imageToSend)
+      } catch {
+        setFileError('Gagal membaca screenshot dari clipboard.')
+        return
+      }
+
+      const formData = new FormData()
+      formData.append('image', imageToSend)
+      formData.append('prompt', userText || 'Jelaskan screenshot ini secara detail.')
+
+      setPrompt('')
+      handleRemoveImage()
+      setMessages(prev => [
+        ...prev,
+        {
+          role: 'user',
+          content: userText,
+          image: base64Image
+        },
+        { role: 'assistant', content: '' }
+      ])
+      setLoading(true)
+
+      try {
+        const response = await fetch('http://127.0.0.1:8000/api/vision/analyze', {
+          method: 'POST',
+          body: formData
+        })
+        if (!response.ok) throw new Error(`Vision upload failed with HTTP ${response.status}`)
+
+        const data: { result?: string; detail?: string } = await response.json()
+        setMessages(prev => [
+          ...prev.slice(0, -1),
+          { role: 'assistant', content: data.result ?? data.detail ?? 'Tidak ada hasil analisis.' }
+        ])
+      } catch {
+        setMessages(prev => [
+          ...prev.slice(0, -1),
+          { role: 'assistant', content: '⚠️ Gagal menganalisis screenshot melalui backend FastAPI.' }
+        ])
+      } finally {
+        setLoading(false)
+      }
+      return
+    }
+
+    if (selectedFile) {
+      const fileToSend = selectedFile
+      if (!isAllowedFile(fileToSend)) {
+        setFileError(
+          !canUploadFile
+            ? 'Pilih tab Vision atau Document Parser untuk melampirkan file.'
+            : activeTab === 'vision'
+              ? 'Mode Vision hanya menerima file PNG, JPG, atau WEBP.'
+              : 'Document Parser hanya menerima file JSON, MD, TS, atau PY.'
+        )
+        return
+      }
+      const userText = prompt.trim()
+      const isVisionFile = activeTab === 'vision'
+      const formData = new FormData()
+      formData.append(isVisionFile ? 'image' : 'file', fileToSend)
+      formData.append('prompt', userText || 'Analisis file ini secara detail.')
+
+      setPrompt('')
+      removeFile()
+      setMessages(prev => [
+        ...prev,
+        {
+          role: 'user',
+          content: `${fileToSend.name}${userText ? `\n${userText}` : ''}`
+        },
+        { role: 'assistant', content: '' }
+      ])
+      setLoading(true)
+
+      try {
+        const targetUrl = isVisionFile
+          ? 'http://127.0.0.1:8000/api/vision/analyze'
+          : 'http://127.0.0.1:8000/api/document/parse'
+        const response = await fetch(targetUrl, {
+          method: 'POST',
+          body: formData
+        })
+
+        if (!response.ok) throw new Error(`Upload failed with HTTP ${response.status}`)
+
+        const data: { result?: string; detail?: string } = await response.json()
+        setMessages(prev => [
+          ...prev.slice(0, -1),
+          { role: 'assistant', content: data.result ?? data.detail ?? 'Tidak ada hasil dari backend.' }
+        ])
+      } catch {
+        setMessages(prev => [
+          ...prev.slice(0, -1),
+          { role: 'assistant', content: '⚠️ Gagal memproses file melalui backend FastAPI.' }
+        ])
+      } finally {
+        setLoading(false)
+      }
+      return
+    }
 
     const userText = prompt
     setPrompt('')
@@ -130,6 +347,30 @@ export default function App(): JSX.Element {
       let buffer = ''
       let accumulatedText = '' // Variabel penampung murni (mencegah duplikasi React)
 
+      const processStreamLine = (line: string): void => {
+        const trimmed = line.trim()
+        if (!trimmed.startsWith('data:')) return
+
+        const payload = trimmed.slice(5).trim()
+        let token = ''
+
+        try {
+          const parsed = JSON.parse(payload)
+          token = parsed.token ?? ''
+        } catch {
+          token = payload
+        }
+
+        if (token) {
+          accumulatedText += token
+          const snapshot = accumulatedText
+          setMessages(prev => [
+            ...prev.slice(0, -1),
+            { role: 'assistant', content: snapshot }
+          ])
+        }
+      }
+
       while (true) {
         const { value, done } = await reader.read()
         if (done) break
@@ -138,30 +379,15 @@ export default function App(): JSX.Element {
         const lines = buffer.split('\n')
         buffer = lines.pop() || ''
 
-        for (const line of lines) {
-          const trimmed = line.trim()
-          if (!trimmed.startsWith('data:')) continue
+        for (const line of lines) processStreamLine(line)
+      }
 
-          const payload = trimmed.slice(5).trim()
-          let token = ''
-
-          try {
-            const parsed = JSON.parse(payload)
-            token = parsed.token ?? ''
-          } catch {
-            token = payload
-          }
-
-          if (token) {
-            accumulatedText += token
-            const snapshot = accumulatedText
-            // Update immutably tanpa memodifikasi object lama secara langsung
-            setMessages(prev => [
-              ...prev.slice(0, -1),
-              { role: 'assistant', content: snapshot }
-            ])
-          }
-        }
+      processStreamLine(buffer)
+      if (!accumulatedText) {
+        setMessages(prev => [
+          ...prev.slice(0, -1),
+          { role: 'assistant', content: '⚠️ Backend tidak mengirim respons.' }
+        ])
       }
     } catch {
       setMessages(prev => [
@@ -351,13 +577,20 @@ export default function App(): JSX.Element {
                         : 'bg-slate-900/90 border border-slate-800/80 text-slate-200 rounded-tl-none font-mono'
                     }`}
                   >
+                    {msg.image && (
+                      <img
+                        src={msg.image}
+                        alt="User upload"
+                        className="mb-2 block max-h-[260px] max-w-[min(520px,70vw)] rounded-lg object-contain"
+                      />
+                    )}
                     {msg.role === 'assistant'
                       ? msg.content
                         ? renderAssistantMessage(msg.content)
                         : loading && idx === messages.length - 1
                           ? 'Sedang berpikir...'
                           : ''
-                      : msg.content}
+                      : msg.content && <div>{msg.content}</div>}
                   </div>
 
                   {msg.role === 'assistant' && msg.content && (
@@ -389,21 +622,78 @@ export default function App(): JSX.Element {
         {/* Input Bar */}
         <div className="p-5 border-t border-slate-800/80 bg-[#0b111e]/40 backdrop-blur-md">
           <div className="max-w-4xl mx-auto flex items-center gap-3 bg-slate-900/80 border border-slate-800 rounded-2xl p-2 focus-within:border-emerald-500/50 transition-colors shadow-inner">
-            <input
-              type="text"
-              value={prompt}
-              onChange={(e): void => setPrompt(e.target.value)}
-              onKeyDown={(e): void => {
-                if (e.key === 'Enter') void handleSend()
-              }}
-              placeholder={`Ketik instruksi untuk ${tabDetails[activeTab].title}...`}
-              className="flex-1 bg-transparent px-4 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none"
-            />
+            <div className="flex-1 min-w-0">
+              {imagePreviewUrl && (
+                <div className="flex items-center gap-2 px-3 pt-1 text-[11px] text-slate-300">
+                  <img
+                    src={imagePreviewUrl}
+                    alt="Pasted screenshot"
+                    className="h-14 w-14 rounded object-cover"
+                  />
+                  <span className="text-slate-400">Screenshot terlampir</span>
+                  <button
+                    type="button"
+                    onClick={handleRemoveImage}
+                    className="text-slate-500 hover:text-rose-400"
+                    title="Hapus screenshot"
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+              )}
+              {selectedFile && (
+                <div className="flex items-center gap-2 px-3 pt-1 text-[11px] text-slate-300">
+                  <span className="truncate">📄 {selectedFile.name}</span>
+                  <button
+                    type="button"
+                    onClick={removeFile}
+                    className="shrink-0 text-slate-500 hover:text-rose-400"
+                    title="Hapus lampiran"
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+              )}
+              {fileError && <div className="px-3 text-[10px] text-rose-400">{fileError}</div>}
+              <div className="flex items-center">
+                <input
+                  type="file"
+                  ref={fileInputRef}
+                  onChange={handleFileChange}
+                  className="hidden"
+                  accept={canUploadFile ? fileAccept : undefined}
+                />
+                <button
+                  type="button"
+                  onClick={triggerFileSelect}
+                  disabled={!canUploadFile || loading}
+                  className="p-2 text-slate-400 hover:text-emerald-400 disabled:opacity-30 disabled:hover:text-slate-400 transition-colors"
+                  title={canUploadFile ? 'Lampirkan file' : 'Pilih Vision atau Document Parser'}
+                >
+                  <Paperclip size={16} />
+                </button>
+                <input
+                  type="text"
+                  value={prompt}
+                  onChange={(e): void => setPrompt(e.target.value)}
+                  onPaste={handlePaste}
+                  onKeyDown={(e): void => {
+                    if (e.key === 'Enter') void handleSend()
+                  }}
+                  placeholder={
+                    activeTab === 'vision'
+                      ? 'Ketik instruksi atau paste screenshot dengan Ctrl+V...'
+                      : `Ketik instruksi untuk ${tabDetails[activeTab].title}...`
+                  }
+                  className="flex-1 min-w-0 bg-transparent px-2 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none"
+                />
+              </div>
+            </div>
             <button
               onClick={(): void => {
                 void handleSend()
               }}
-              disabled={loading || !prompt.trim()}
+              disabled={loading || (!prompt.trim() && !selectedFile && !imageFile)}
               className="bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 disabled:hover:bg-emerald-600 text-white px-4 py-2.5 rounded-xl flex items-center gap-2 text-xs font-medium transition-all shadow-md shadow-emerald-900/30"
             >
               {loading ? (

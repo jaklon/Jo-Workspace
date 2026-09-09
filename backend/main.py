@@ -6,7 +6,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 import httpx
-import pynvml
+import pynvml  # Sekarang sudah menggunakan wrapper resmi nvidia-ml-py
+from agent import execute_agent_pipeline
 
 app = FastAPI(title="Local Multi-Model Agent Engine")
 
@@ -25,7 +26,7 @@ OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 MODEL_MAPPING = {
     "reasoning": "deepseek-r1:7b",
     "coding": "qwen2.5-coder:7b",
-    "vision": "llava:7b"  # atau qwen2-vl / model vision lain yang terdaftar di ollama
+    "vision": "minicpm-v:latest" 
 }
 
 
@@ -117,30 +118,87 @@ async def chat_endpoint(payload: ChatPayload):
 @app.post("/api/vision/analyze")
 async def vision_endpoint(
     image: UploadFile = File(...),
-    prompt: str = Form("Jelaskan diagram/screenshot ini secara detail.")
+    prompt: str = Form("Jelaskan diagram/screenshot ini secara detail."),
 ):
-    """Endpoint analisis gambar/diagram multimodal via Ollama vision model."""
     image_bytes = await image.read()
     b64_image = base64.b64encode(image_bytes).decode("utf-8")
     vision_model = MODEL_MAPPING.get("vision", "llava:7b")
 
+    print(f"\n[DEBUG VISION] Target model: {vision_model}")
+    print(f"[DEBUG VISION] Ukuran byte gambar: {len(image_bytes)}")
+
+    system_instruction = (
+        "Kamu adalah asisten visual AI teknis. Deskripsikan elemen visual antarmuka, "
+        "teks, diagram, atau komponen yang terlihat pada gambar ini secara objektif dan jelas "
+        "dalam bahasa Indonesia."
+    )
+
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=None) as client:
             resp = await client.post(
                 f"{OLLAMA_BASE_URL}/api/generate",
                 json={
                     "model": vision_model,
+                    "system": system_instruction,
                     "prompt": prompt,
                     "images": [b64_image],
-                    "stream": False
-                }
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.2,
+                    },
+                },
             )
+
+            # Cetak respons asli dari Ollama jika gagal
             if resp.status_code != 200:
-                raise HTTPException(status_code=500, detail="Gagal memproses gambar melalui engine vision.")
+                print(f"[OLLAMA ERROR STATUS]: {resp.status_code}")
+                print(f"[OLLAMA ERROR BODY]: {resp.text}")
+                raise HTTPException(
+                    status_code=resp.status_code,
+                    detail=f"Ollama Error: {resp.text}",
+                )
 
             result_data = resp.json()
             return {"result": result_data.get("response", "")}
     except httpx.ConnectError:
-        raise HTTPException(status_code=503, detail="Tidak dapat tersambung ke Ollama. Pastikan Ollama aktif.")
+        raise HTTPException(
+            status_code=503,
+            detail="Tidak dapat tersambung ke Ollama. Pastikan Ollama aktif.",
+        )
+
+class AgentPayload(BaseModel):
+    prompt: str
+    max_iterations: int = 5
+
+
+@app.post("/api/agent/run")
+async def run_agent_endpoint(payload: AgentPayload):
+    try:
+        # Menjalankan loop tool-calling dari agent.py
+        result = execute_agent_pipeline(
+            payload.prompt, max_iterations=payload.max_iterations
+        )
+        return {"status": "success", "result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))   
     
+@app.post("/api/document/parse")
+async def parse_document_endpoint(
+    file: UploadFile = File(...), prompt: str = Form(...)
+):
+    try:
+        content_bytes = await file.read()
+        file_text = content_bytes.decode("utf-8", errors="ignore")
+
+        # Buat prompt yang menggabungkan isi file dengan instruksi user
+        combined_prompt = (
+            f"Konten file '{file.filename}':\n```\n{file_text}\n```\n\n"
+            f"Instruksi pengguna: {prompt}"
+        )
+
+        # Jalankan ke agent pipeline untuk dianalisis/dimodifikasi
+        result = execute_agent_pipeline(combined_prompt)
+        return {"status": "success", "result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) 
     
