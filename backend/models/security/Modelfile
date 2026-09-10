@@ -1,0 +1,5 @@
+FROM ./Qwen3.8-9B-heretic-uncensored.i1-Q4_K_M.gguf
+
+PARAMETER num_ctx 4096
+PARAMETER temperature 0.2
+PARAMETER stop "<|im_end|>"

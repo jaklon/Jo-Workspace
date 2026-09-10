@@ -1,22 +1,24 @@
 import re
-import ollama
 import json
+from ollama import Client
 from tools import TOOL_DEFINITIONS, TOOL_RUNNERS
 
-REASONING_MODEL = "deepseek-r1:7b"
-CODING_MODEL = "qwen2.5-coder:7b"
+ollama_client = Client(host="http://127.0.0.1:11434")
+
+# Model yang sama menangani perencanaan reasoning dan eksekusi coding/tool-calling.
+AGENT_MODEL = "qwen-9b-reasoning"
 
 
-def strip_think_tags(text: str) -> str:
-    """Membersihkan tag <think>...</think> agar context coder bersih."""
+def clean_output(text: str) -> str:
+    """Membersihkan tag <think>...</think> dari jawaban model."""
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
 
 def run_reasoning_step(user_prompt: str, history: list) -> str:
-    """Stage 1: DeepSeek-R1 merumuskan rencana eksekusi."""
+    """Stage 1: Qwen 9B merumuskan rencana eksekusi."""
     system_prompt = (
         "Kamu adalah AI Lead Architect. Analisis kebutuhan user dan buat rencana langkah kerja "
-        "yang ringkas untuk coder agent. Tentukan file apa yang perlu dibaca atau diubah."
+        "yang ringkas untuk dieksekusi. Jawab dalam bahasa Indonesia."
     )
     messages = [
         {"role": "system", "content": system_prompt},
@@ -24,30 +26,36 @@ def run_reasoning_step(user_prompt: str, history: list) -> str:
         {"role": "user", "content": user_prompt},
     ]
 
-    response = ollama.chat(model=REASONING_MODEL, messages=messages)
-    raw_content = response["message"]["content"]
-    return strip_think_tags(raw_content)
+    response = ollama_client.chat(
+        model=AGENT_MODEL,
+        messages=messages,
+        options={"temperature": 0.2, "num_ctx": 4096},
+    )
+    return clean_output(response["message"]["content"])
 
 
 def run_coder_step(plan: str, history: list):
-    """Stage 2: Qwen2.5-Coder memilih tools berdasarkan plan arsitek."""
+    """Stage 2: Qwen 9B memilih tools berdasarkan plan arsitek."""
     messages = [
         {
             "role": "system",
             "content": (
                 "Kamu adalah AI Execution Engineer. Jalankan rencana berikut menggunakan tools yang tersedia. "
-                "Hanya panggil tool yang relevan, atau berikan jawaban final jika tugas selesai."
+                "Panggil tool yang sesuai atau berikan konfirmasi jika tugas selesai."
             ),
         },
         *history,
         {
             "role": "user",
-            "content": f"Rencana dari Arsitek:\n{plan}\n\nLakukan aksi sekarang.",
+            "content": f"Rencana Kerja:\n{plan}\n\nLakukan aksi sekarang.",
         },
     ]
 
-    response = ollama.chat(
-        model=CODING_MODEL, messages=messages, tools=TOOL_DEFINITIONS
+    response = ollama_client.chat(
+        model=AGENT_MODEL,
+        messages=messages,
+        tools=TOOL_DEFINITIONS,
+        options={"temperature": 0.1, "num_ctx": 4096},
     )
     return response["message"]
 
