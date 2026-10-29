@@ -15,6 +15,7 @@ MODELS = {
 }
 CONTEXT_TOKENS = int(os.getenv("CONTEXT_TOKENS", "4096"))
 OUTPUT_TOKENS = min(int(os.getenv("OUTPUT_TOKENS", "768")), CONTEXT_TOKENS // 3)
+THINKING_TOKENS = int(os.getenv("THINKING_TOKENS", "1024"))
 MODEL_TIMEOUT = float(os.getenv("MODEL_TIMEOUT", "120"))
 QUEUE_TIMEOUT = float(os.getenv("QUEUE_TIMEOUT", "30"))
 MAX_UPLOAD = 8 * 1024 * 1024

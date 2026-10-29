@@ -28,7 +28,7 @@ from config import MAX_BODY
 from contracts import ChatPayload
 from doc_engine import parse_document_file
 from main import app
-from model_runtime import ModelRuntime, bounded_messages, clean_answer
+from model_runtime import ModelRuntime, ThinkSplitter, bounded_messages, clean_answer
 from router import retrieve, detect_pipeline_route
 from store import Store
 
@@ -122,6 +122,12 @@ class DocumentTests(unittest.TestCase):
         self.assertEqual(clean_answer("<think>secret</think>Jawaban"), "Jawaban")
         self.assertEqual(clean_answer("Thinking Process: secret\nFinal Answer: Aman"), "Aman")
         self.assertEqual(clean_answer("Analysis: secret only"), "")
+
+    def test_think_splitter_handles_tags_split_across_chunks(self):
+        splitter = ThinkSplitter()
+        parts = [*splitter.feed("Halo <th"), *splitter.feed("ink>rahasia</thi"), *splitter.feed("nk> dunia"), *splitter.flush()]
+        self.assertEqual("".join(text for kind, text in parts if kind == "token"), "Halo  dunia")
+        self.assertEqual("".join(text for kind, text in parts if kind == "thinking"), "rahasia")
 
     def test_image_dispatch_is_explicit(self):
         self.assertEqual(detect_pipeline_route("x.jpeg", "describe"), "VISION_PIPELINE")
@@ -485,9 +491,45 @@ class ApiTests(unittest.TestCase):
         self.assertIn("CENDANA-58", followup.text)
         followup_events = self.events(followup)
         self.assertEqual(followup_events[-1]["type"], "done")
-        self.assertNotIn("token", [item["type"] for item in followup_events])
+        self.assertEqual("".join(e["token"] for e in followup_events if e["type"] == "token"), "CENDANA-58")
         invalid = self.client.post("/api/chat", headers=self.headers, json={"prompt": "Gudang?", "session_id": "other", "attachment_ids": [attachment["id"]]})
         self.assertEqual(invalid.status_code, 400)
+
+    def test_chat_streams_reasoning_separately_from_answer(self):
+        async def chunks(model, messages, **kwargs):
+            self.assertTrue(kwargs.get("think"))
+            yield {"status": "running", "model": model}
+            yield {"message": {"thinking": "native-reasoning "}}
+            yield {"message": {"content": "<think>tagged-reasoning</think>Jawaban "}}
+            yield {"message": {"content": "akhir"}}
+            yield {"done": True, "done_reason": "stop", "eval_count": 4, "eval_duration": 2_000_000_000}
+        with patch("main.runtime.chunks", new=chunks):
+            events = self.events(self.client.post("/api/chat", headers=self.headers, json={"prompt": "test"}))
+        tokens = "".join(e["token"] for e in events if e["type"] == "token")
+        thinking = "".join(e["token"] for e in events if e["type"] == "thinking")
+        self.assertEqual(tokens, "Jawaban akhir")
+        self.assertEqual(thinking, "native-reasoning tagged-reasoning")
+        self.assertEqual(next(e for e in events if e["type"] == "result")["result"], "Jawaban akhir")
+        steps = [e["step"] for e in events if e["type"] == "status"]
+        self.assertLess(steps.index("thinking"), steps.index("writing"))
+        self.assertIn("2,0 token/dtk", [e for e in events if e["type"] == "status"][-1]["detail"])
+
+    def test_exhausted_reasoning_budget_answers_without_thinking(self):
+        calls = []
+        async def chunks(model, messages, **kwargs):
+            calls.append(kwargs.get("think"))
+            if kwargs.get("think"):
+                yield {"message": {"thinking": "panjang sekali"}}
+                yield {"done": True, "done_reason": "length"}
+            else:
+                yield {"message": {"content": "Jawaban langsung"}}
+                yield {"done": True, "done_reason": "stop"}
+        with patch("main.runtime.chunks", new=chunks):
+            events = self.events(self.client.post("/api/chat", headers=self.headers, json={"prompt": "test"}))
+        self.assertEqual(calls, [True, False])
+        self.assertIn("fallback", [e.get("step") for e in events])
+        self.assertEqual(next(e for e in events if e["type"] == "result")["result"], "Jawaban langsung")
+        self.assertEqual(events[-1]["type"], "done")
 
     def test_stream_model_failure_is_typed_error(self):
         async def chunks(*args, **kwargs):

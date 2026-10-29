@@ -71,7 +71,7 @@ async def prepare_chat(store, payload):
         attachments = [await asyncio.to_thread(store.attachment, item, payload.session_id) for item in payload.attachment_ids]
         system = DOCUMENT_SYSTEM
         context, sources, coverage = retrieve(attachments, payload.prompt, system)
-    messages = bounded_messages(system, payload.prompt, payload.history, context)
+    messages = bounded_messages(system, payload.prompt, payload.history, context, thinking=True)
     model = payload.model_override or MODELS["reasoning" if payload.target == "vision" else payload.target]
     return model, messages, sources, coverage
 

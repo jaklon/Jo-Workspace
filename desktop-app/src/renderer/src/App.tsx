@@ -46,6 +46,8 @@ import { Usage } from './components/Usage'
 import { ProjectEditor, SessionEditor } from './components/OrganizeDialogs'
 import { Connection } from './components/Connection'
 import { MarkdownAnswer, MessageDetails, MessageImage } from './components/MessageDetails'
+import { MessageTrace } from './components/MessageTrace'
+import { applyStreamEvent, finishTrace, traceStatus } from './lib/trace'
 import { SecurityDashboard } from './components/SecurityDashboard'
 import { SearchWorkspace } from './components/SearchWorkspace'
 
@@ -655,11 +657,11 @@ export default function App(): JSX.Element {
     let pending: Message = {
       role: 'assistant',
       content: '',
-      analysisProgress: {
+      trace: traceStatus([], {
+        type: 'status',
         step: 'queued',
-        label: upload ? 'Mengunggah dan memproses lampiran' : 'Menunggu giliran model',
-        completedSteps: []
-      }
+        label: upload ? 'Mengunggah dan memproses lampiran' : 'Menunggu giliran model'
+      })
     }
     replacePendingMessageInActiveTab(pending)
     const rememberAttachment = (attachment: Attachment): void => {
@@ -680,21 +682,7 @@ export default function App(): JSX.Element {
     }
     const onEvent = (event: StreamEvent): void => {
       if (event.attachment) rememberAttachment(event.attachment)
-      if (event.type === 'status')
-        pending = {
-          ...pending,
-          analysisProgress: {
-            step: event.step || 'running',
-            label: event.label || 'Memproses',
-            completedSteps: []
-          }
-        }
-      if (event.type === 'token')
-        pending = {
-          ...pending,
-          content: pending.content + (event.token || ''),
-          analysisProgress: undefined
-        }
+      pending = applyStreamEvent(pending, event)
       if (event.sources || event.images)
         pending = {
           ...pending,
@@ -707,10 +695,15 @@ export default function App(): JSX.Element {
           ...pending,
           content: event.result || '',
           proposals: event.proposals,
-          analysisProgress: undefined
+          trace: finishTrace(pending.trace)
         }
       if (event.type === 'action_proposal' && event.action)
-        pending = { ...pending, content: '', action: event.action, analysisProgress: undefined }
+        pending = {
+          ...pending,
+          content: '',
+          action: event.action,
+          trace: finishTrace(pending.trace)
+        }
       replacePendingMessageInActiveTab({ ...pending })
     }
     try {
@@ -739,7 +732,7 @@ export default function App(): JSX.Element {
           : 'Permintaan gagal.'
       replacePendingMessageInActiveTab({
         ...pending,
-        analysisProgress: undefined,
+        trace: finishTrace(pending.trace),
         content: (pending.content ? pending.content + '\n\n' : '') + '⚠️ ' + reason
       })
     } finally {
@@ -805,11 +798,12 @@ export default function App(): JSX.Element {
       const controller = new AbortController()
       abortRef.current = controller
       setLoading(true)
-      appendMessageToActiveTab({
+      let message: Message = {
         role: 'assistant',
         content: '',
-        analysisProgress: { step: 'upload', label: 'Memproses lampiran', completedSteps: [] }
-      })
+        trace: traceStatus([], { type: 'status', step: 'upload', label: 'Memproses lampiran' })
+      }
+      appendMessageToActiveTab(message)
       const remember = (attachment: Attachment): void =>
         setSessionsByTab((previous) => ({
           ...previous,
@@ -834,18 +828,9 @@ export default function App(): JSX.Element {
           body: data,
           signal: controller.signal
         })
-        let message: Message = { role: 'assistant', content: '' }
         await consumeStream(response, (event) => {
           if (event.attachment) remember(event.attachment)
-          if (event.type === 'status')
-            message = {
-              ...message,
-              analysisProgress: {
-                step: event.step || 'running',
-                label: event.label || 'Memproses',
-                completedSteps: []
-              }
-            }
+          message = applyStreamEvent(message, event)
           if (event.type === 'result')
             message = {
               ...message,
@@ -853,13 +838,14 @@ export default function App(): JSX.Element {
               visualAnalysis: event.visual_analysis || undefined,
               sources: event.sources,
               coverage: event.coverage,
-              analysisProgress: undefined
+              trace: finishTrace(message.trace)
             }
           replacePendingMessageInActiveTab({ ...message })
         })
       } catch (error) {
         replacePendingMessageInActiveTab({
           role: 'assistant',
+          trace: finishTrace(message.trace),
           content: `⚠️ ${controller.signal.aborted ? 'Dihentikan oleh pengguna.' : error instanceof Error ? error.message : 'Pemrosesan gagal.'}`
         })
       } finally {
@@ -894,6 +880,11 @@ export default function App(): JSX.Element {
     abortRef.current = controller
     setLoading(true)
     let responseStarted = false
+    let pending: Message = {
+      role: 'assistant',
+      content: '',
+      trace: traceStatus([], { type: 'status', step: 'queued', label: 'Menyiapkan tindakan' })
+    }
     try {
       const response = await apiFetch(`/api/chat/actions/${encodeURIComponent(id)}/confirm`, {
         method: 'POST',
@@ -917,24 +908,12 @@ export default function App(): JSX.Element {
               }
             : m
         ),
-        {
-          role: 'assistant',
-          content: '',
-          analysisProgress: { step: 'queued', label: 'Menyiapkan tindakan', completedSteps: [] }
-        }
+        pending
       ])
       responseStarted = true
-      let pending: Message = { role: 'assistant', content: '' }
       await consumeStream(response, (event) => {
-        if (event.type === 'status')
-          pending = {
-            ...pending,
-            analysisProgress: {
-              step: event.step || 'running',
-              label: event.label || 'Memproses',
-              completedSteps: []
-            }
-          }
+        pending = applyStreamEvent(pending, event)
+        if (event.type === 'sources') pending = { ...pending, sources: event.sources }
         if (event.type === 'result')
           pending = {
             ...pending,
@@ -942,7 +921,7 @@ export default function App(): JSX.Element {
             proposals: event.proposals,
             sources: event.sources,
             webImages: event.images,
-            analysisProgress: undefined
+            trace: finishTrace(pending.trace)
           }
         replacePendingMessageInActiveTab({ ...pending })
       })
@@ -954,7 +933,11 @@ export default function App(): JSX.Element {
           : 'Tindakan gagal.'
       setMessagesInActiveSession((messages) => [
         ...(responseStarted ? messages.slice(0, -1) : messages),
-        { role: 'assistant', content: '⚠️ ' + detail }
+        {
+          role: 'assistant',
+          content: '⚠️ ' + detail,
+          trace: responseStarted ? finishTrace(pending.trace) : undefined
+        }
       ])
       throw error
     } finally {
@@ -1290,11 +1273,14 @@ export default function App(): JSX.Element {
                                   </div>
                                 </details>
                               )}
+                              <MessageTrace trace={msg.trace} thinking={msg.thinking} />
                               {msg.analysisProgress
                                 ? renderAnalysisProgress(msg.analysisProgress)
                                 : msg.content
                                   ? renderAssistantMessage(msg.content)
-                                  : loading && idx === currentMessages.length - 1
+                                  : loading &&
+                                      idx === currentMessages.length - 1 &&
+                                      !msg.trace?.length
                                     ? 'Menunggu respons model...'
                                     : ''}
                               <MessageDetails

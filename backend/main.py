@@ -20,7 +20,7 @@ from fastapi.exceptions import RequestValidationError
 from sse_starlette.sse import EventSourceResponse
 from config import ROOT, WORKSPACE_DIR, MODELS, OLLAMA_URL, ALLOWED_ORIGINS, MODEL_TIMEOUT, WEB_DIST_DIR, DOCUMENT_EXTENSIONS, IMAGE_EXTENSIONS, MAX_UPLOAD
 from contracts import ChatPayload, AgentPayload, HistoryMessage, event
-from model_runtime import runtime, clean_answer
+from model_runtime import runtime, clean_answer, ThinkSplitter
 from security import ApiBoundary, load_token, session_cookie, image_ticket
 from store import Store
 from services import read_upload, ingest_document, ingest_image, prepare_chat, answer_chat, until_disconnect
@@ -309,6 +309,55 @@ async def execute_chat_upload(action_id: str, request: Request, file: UploadFile
     return EventSourceResponse(stream(), ping=10)
 
 
+TRACE_PHASES = {"thinking": {"step": "thinking", "label": "Berpikir"},
+                "token": {"step": "writing", "label": "Menulis jawaban"}}
+INTENT_LABELS = {"chat": "percakapan", "coding": "coding agent", "security": "pemeriksaan keamanan", "web": "pencarian web"}
+
+
+async def stream_answer(model, messages, out):
+    """Stream reasoning and answer text as trace events; the raw answer lands in out['text'].
+
+    Reasoning goes out as `thinking` events, never mixed into answer `token` events. If the
+    reasoning budget runs out before any answer, a second pass answers without thinking."""
+    out["text"] = ""
+    for think in (True, False):
+        splitter, phase, exhausted = ThinkSplitter(), None, False
+        async for chunk in runtime.chunks(model, messages, think=think):
+            if chunk.get("status") == "running":
+                yield wire(event("status", step="model", label="Memuat model dan membaca prompt", detail=model))
+            elif chunk.get("status") == "thinking_unsupported":
+                yield wire(event("status", step="model", label="Memuat model dan membaca prompt",
+                                 detail=f"{model} · model tidak mendukung penalaran, menjawab langsung"))
+            message = chunk.get("message", {})
+            parts = [("thinking", message.get("thinking") or ""), *splitter.feed(message.get("content") or "")]
+            if chunk.get("done"):
+                parts += splitter.flush()
+            for kind, text in parts:
+                if not text:
+                    continue
+                if kind != phase:
+                    phase = kind
+                    yield wire(event("status", **TRACE_PHASES[kind]))
+                if kind == "token":
+                    out["text"] += text
+                yield wire(event(kind, token=text))
+            if not chunk.get("done"):
+                continue
+            if chunk.get("done_reason") == "length":
+                if not (think and not clean_answer(out["text"])):
+                    raise ValueError("Batas token tercapai. Jawaban belum lengkap; persempit pertanyaan.")
+                exhausted = True
+            elif phase == "token":
+                tokens, seconds = chunk.get("eval_count") or 0, (chunk.get("eval_duration") or 0) / 1e9
+                yield wire(event("status", **TRACE_PHASES["token"],
+                                 detail=f"{tokens} token dihasilkan (penalaran + jawaban) · "
+                                        f"{tokens / seconds:.1f} token/dtk".replace(".", ",") if seconds and tokens else None))
+        if not exhausted:
+            return
+        out["text"] = ""
+        yield wire(event("status", step="fallback", label="Anggaran penalaran habis, menjawab tanpa penalaran"))
+
+
 async def validate_model_override(model):
     if not model:
         return None
@@ -336,9 +385,12 @@ async def chat_endpoint(payload: ChatPayload, request: Request):
             yield wire(event("status", step="queued", label="Menunggu giliran model"))
             if payload.unified:
                 yield wire(event("status", step="routing", label="Menentukan jenis permintaan"))
-                intent = await classify(payload.prompt, payload.history, payload.model_override or MODELS["reasoning"])
+                router_model = payload.model_override or MODELS["reasoning"]
+                intent = await classify(payload.prompt, payload.history, router_model)
                 if payload.web_mode == "on" and intent == "chat":
                     intent = "web"
+                yield wire(event("status", step="routing", label="Menentukan jenis permintaan",
+                                 detail=f"Intent: {INTENT_LABELS[intent]} · router {router_model}"))
                 if intent == "coding":
                     if payload.attachment_ids:
                         yield wire(event("result", result="Coding Agent belum menggunakan lampiran sebagai konteks. Lepaskan lampiran atau sebutkan file workspace yang ingin diperiksa.", sources=[], images=[]))
@@ -354,8 +406,12 @@ async def chat_endpoint(payload: ChatPayload, request: Request):
                 if intent == "security" and not payload.model_override:
                     model = MODELS["security"]
                 if intent == "security":
+                    yield wire(event("status", step="planning", label="Mengekstrak target, port, dan tool dari pesan"))
                     slots = await security_slots(payload.prompt, payload.history, payload.model_override or MODELS["reasoning"])
                     plan, question = prepare_plan(slots)
+                    yield wire(event("status", step="planning", label="Mengekstrak target, port, dan tool dari pesan",
+                                     detail="Parameter belum lengkap, perlu pertanyaan lanjutan" if question else
+                                     "Tool: " + ", ".join(item["tool"] for item in (plan.get("jobs") or [plan]))))
                     if question:
                         yield wire(event("result", result=question, sources=[], images=[]))
                         yield wire(event("done"))
@@ -422,25 +478,19 @@ async def chat_endpoint(payload: ChatPayload, request: Request):
                 images = web['images']
                 yield wire(event("status", step="web_sources", label="Menyusun jawaban dari sumber web"))
             else:
+                yield wire(event("status", step="context", label="Menyiapkan konteks"))
                 _, messages, sources, coverage = prepared or await prepare_chat(request.app.state.store, payload)
                 images = []
+                yield wire(event("status", step="context", label="Menyiapkan konteks",
+                                 detail=f"{len(messages) - 2} pesan riwayat · {len(sources)} sumber lampiran"))
             if coverage:
                 yield wire(event("sources", sources=sources, coverage=coverage))
             elif web:
                 yield wire(event("sources", sources=sources, images=images))
-            text = ""
-            async for chunk in runtime.chunks(model, messages):
-                if chunk.get("status") == "running":
-                    yield wire(event("status", step="running", label="Model sedang memproses"))
-                token = chunk.get("message", {}).get("content", "")
-                if token:
-                    text += token
-                    # Never expose partial model text: older/custom model templates can
-                    # place private reasoning in content before the final answer. The UI
-                    # still receives queue/running status and a cleaned terminal result.
-                if chunk.get("done_reason") == "length":
-                    raise ValueError("Batas token tercapai. Jawaban belum lengkap; persempit pertanyaan.")
-            answer = clean_answer(text)
+            out = {}
+            async for item in stream_answer(model, messages, out):
+                yield item
+            answer = clean_answer(out["text"])
             if not answer or answer.lower().startswith("thinking process"):
                 raise ValueError("Model tidak menghasilkan jawaban akhir.")
             if web:
@@ -500,12 +550,13 @@ async def confirm_chat_action(action_id: str, payload: ChatActionDecision, reque
                 web = await web_context(action["prompt"], "on", model, action.get("history", []))
                 if not web:
                     raise ValueError("Tidak ada sumber web yang dapat digunakan.")
-                text = ""
-                async for chunk in runtime.chunks(model, web["messages"]):
-                    text += chunk.get("message", {}).get("content", "")
-                    if chunk.get("done_reason") == "length":
-                        raise ValueError("Batas token tercapai. Persingkat permintaan.")
-                answer = clean_answer(text)
+                yield wire(event("status", step="web", label="Mencari sumber web",
+                                 detail=f"{len(web['sources'])} sumber · {len(web['images'])} gambar"))
+                yield wire(event("sources", sources=web["sources"]))
+                out = {}
+                async for item in stream_answer(model, web["messages"], out):
+                    yield item
+                answer = clean_answer(out["text"])
                 if not answer:
                     raise ValueError("Model tidak menghasilkan jawaban akhir.")
                 images = [{**item, 'ticket': image_ticket(request.state.api_token, item['url'], int(time.time()) + 900)} for item in web['images']]

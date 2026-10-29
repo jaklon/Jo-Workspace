@@ -65,7 +65,12 @@ export function validate(value: unknown): Saved {
             ...m,
             image: undefined,
             imageBlob: undefined,
-            analysisProgress: undefined
+            analysisProgress: undefined,
+            // A stream cut off by closing the app must not leave a step spinning forever.
+            trace: Array.isArray(m.trace)
+              ? m.trace.map((s) => (s.endedAt ? s : { ...s, endedAt: s.startedAt }))
+              : undefined,
+            thinking: typeof m.thinking === 'string' ? m.thinking : undefined
           }))
           .slice(-MAX_MESSAGES_PER_SESSION)
       }))

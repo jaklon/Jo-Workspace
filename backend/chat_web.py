@@ -6,7 +6,7 @@ from urllib.parse import urlsplit
 
 from scrapling import Selector
 
-from config import CONTEXT_TOKENS, OUTPUT_TOKENS
+import config
 from browser_render import render_public
 from model_runtime import bounded_messages, runtime, token_upper_bound
 from search_workspace import SearchQuery, extract_images, get_public, public_url, query
@@ -155,7 +155,7 @@ async def web_context(prompt, mode, model, history=()):
                 row['fetch_error'] = type(exc).__name__
     if plan['url'] and not (rows[0].get('page_text') or rows[0].get('metadata_text')):
         raise ValueError('Halaman URL tidak dapat dibaca. Periksa izin akses situs atau gunakan sumber lain; proteksi situs tidak dilewati.')
-    remaining = max(500, CONTEXT_TOKENS - OUTPUT_TOKENS - token_upper_bound(WEB_SYSTEM + prompt) - 650)
+    remaining = max(500, config.CONTEXT_TOKENS - config.OUTPUT_TOKENS - config.THINKING_TOKENS - token_upper_bound(WEB_SYSTEM + prompt) - 650)
     context, sources = [], []
     for row in rows:
         number = len(sources) + 1
@@ -185,7 +185,7 @@ async def web_context(prompt, mode, model, history=()):
     image_notice = (f"Ada {len(images)} kandidat tautan gambar pada galeri terpisah di UI. "
                     "Sebagian tautan mungkin gagal dimuat; jangan menyatakan tidak ada gambar jika kandidat tersedia. "
                     "Jangan mengklaim telah melihat isi visual gambar hanya dari URL, judul, atau alt.\n\n") if plan['images'] else ''
-    messages = bounded_messages(WEB_SYSTEM, prompt, history, image_notice + '\n\n'.join(context))
+    messages = bounded_messages(WEB_SYSTEM, prompt, history, image_notice + '\n\n'.join(context), thinking=True)
     return {'messages': messages, 'sources': sources, 'images': images[:8], 'coverage': None}
 
 

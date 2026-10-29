@@ -28,3 +28,22 @@ for (const read of [r => consumeStream(r, () => {}), readAnswer]) {
 }
 await assert.rejects(() => readAnswer(new Response('{"detail":"Unauthorized"}', { status: 401 })), /Unauthorized/)
 console.log('9 SSE assertions passed (desktop + VS Code): UTF-8, CRLF, terminal event, errors, content type, HTTP failure.')
+
+const { applyStreamEvent, finishTrace, traceStatus } = await moduleAt('../desktop-app/src/renderer/src/lib/trace.ts')
+let message = { role: 'assistant', content: '', trace: traceStatus([], { type: 'status', step: 'queued', label: 'Antre' }, 0) }
+for (const [event, at] of [
+  [{ type: 'status', step: 'routing', label: 'Routing' }, 100],
+  [{ type: 'status', step: 'routing', label: 'Routing', detail: 'Intent: percakapan' }, 900],
+  [{ type: 'status', step: 'thinking', label: 'Berpikir' }, 1000],
+  [{ type: 'thinking', token: 'pikir ' }, 1100],
+  [{ type: 'thinking', token: 'dulu' }, 1200],
+  [{ type: 'status', step: 'writing', label: 'Menulis' }, 3000],
+  [{ type: 'token', token: 'Halo' }, 3100]
+]) message = applyStreamEvent(message, event, at)
+assert.deepEqual(message.trace.map((s) => [s.step, s.startedAt, s.endedAt]),
+  [['queued', 0, 100], ['routing', 100, 1000], ['thinking', 1000, 3000], ['writing', 3000, undefined]])
+assert.equal(message.trace[1].detail, 'Intent: percakapan')
+assert.equal(message.thinking, 'pikir dulu')
+assert.equal(message.content, 'Halo')
+assert.equal(finishTrace(message.trace, 4000)[3].endedAt, 4000)
+console.log('5 trace assertions passed: step merge, step timing, reasoning/answer separation, finish.')

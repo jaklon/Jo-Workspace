@@ -61,6 +61,13 @@ export interface AnalysisProgress {
   detail?: string
   completedSteps: string[]
 }
+export interface TraceStep {
+  step: string
+  label: string
+  detail?: string
+  startedAt: number
+  endedAt?: number
+}
 export interface PentestFinding {
   check: string
   status: string
@@ -84,6 +91,8 @@ export interface Message {
   imageBlob?: Blob
   visualAnalysis?: string
   analysisProgress?: AnalysisProgress
+  trace?: TraceStep[]
+  thinking?: string
   sources?: Source[]
   webImages?: WebImage[]
   coverage?: Coverage
@@ -111,12 +120,20 @@ export type ChatSessionMap = Record<TabType, ChatSession[]>
 export type ActiveSessionMap = Record<TabType, string>
 export interface StreamEvent {
   type:
-    'status' | 'token' | 'attachment' | 'sources' | 'result' | 'error' | 'done' | 'action_proposal'
+    | 'status'
+    | 'token'
+    | 'thinking'
+    | 'attachment'
+    | 'sources'
+    | 'result'
+    | 'error'
+    | 'done'
+    | 'action_proposal'
   token?: string
   result?: string
   step?: string
   label?: string
-  detail?: string
+  detail?: string | null
   attachment?: Attachment
   sources?: Source[]
   images?: WebImage[]

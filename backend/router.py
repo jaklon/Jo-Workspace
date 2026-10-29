@@ -49,7 +49,7 @@ def retrieve(attachments, prompt, system):
     def score(chunk):
         return len(terms & set(re.findall(r"\w+", chunk["text"].lower())))
     ranked = sorted(enumerate(candidates), key=lambda item: (-score(item[1]), item[0]))
-    available = config.CONTEXT_TOKENS - config.OUTPUT_TOKENS - token_upper_bound(system + prompt) - 450
+    available = config.CONTEXT_TOKENS - config.OUTPUT_TOKENS - config.THINKING_TOKENS - token_upper_bound(system + prompt) - 450
     selected = []
     for _, chunk in ranked:
         label = f"[{chunk['filename']} bagian {chunk['section']}, baris {chunk['line_start']}-{chunk['line_end']}]"

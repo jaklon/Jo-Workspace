@@ -35,6 +35,7 @@ interface ServerSettings {
   inference: {
     context_tokens: number
     output_tokens: number
+    thinking_tokens: number
     temperature: number
     model_timeout: number
     queue_timeout: number
@@ -542,6 +543,21 @@ export function Settings({
                         '128–8192 token, maksimal sepertiga context window.',
                         128,
                         Math.min(8192, Math.floor(draft.inference.context_tokens / 3)),
+                        1
+                      ],
+                      [
+                        'thinking_tokens',
+                        'Token penalaran',
+                        '0 mematikan penalaran. Jawaban + penalaran maksimal dua pertiga context window; penalaran ditampilkan di chat.',
+                        0,
+                        Math.max(
+                          0,
+                          Math.min(
+                            8192,
+                            Math.floor((draft.inference.context_tokens * 2) / 3) -
+                              draft.inference.output_tokens
+                          )
+                        ),
                         1
                       ],
                       [

@@ -9,6 +9,7 @@ class InferenceSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
     context_tokens: int = Field(default=config.CONTEXT_TOKENS, ge=2048, le=32768)
     output_tokens: int = Field(default=config.OUTPUT_TOKENS, ge=128, le=8192)
+    thinking_tokens: int = Field(default=config.THINKING_TOKENS, ge=0, le=8192)
     temperature: float = Field(default=0.2, ge=0, le=2)
     model_timeout: int = Field(default=int(config.MODEL_TIMEOUT), ge=30, le=600)
     queue_timeout: int = Field(default=int(config.QUEUE_TIMEOUT), ge=5, le=120)
@@ -17,6 +18,8 @@ class InferenceSettings(BaseModel):
     def output_budget(self):
         if self.output_tokens > self.context_tokens // 3:
             raise ValueError("Token jawaban maksimal sepertiga context window.")
+        if self.output_tokens + self.thinking_tokens > self.context_tokens * 2 // 3:
+            raise ValueError("Token jawaban ditambah token penalaran maksimal dua pertiga context window.")
         return self
 
 
@@ -44,6 +47,7 @@ def apply_settings(value):
     config.MODELS.update(value.models.model_dump())
     config.CONTEXT_TOKENS = value.inference.context_tokens
     config.OUTPUT_TOKENS = value.inference.output_tokens
+    config.THINKING_TOKENS = value.inference.thinking_tokens
     config.MODEL_TIMEOUT = value.inference.model_timeout
     config.QUEUE_TIMEOUT = value.inference.queue_timeout
 
