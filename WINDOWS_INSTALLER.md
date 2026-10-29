@@ -93,6 +93,25 @@ interaktif. Mode silent `/S` dipakai hanya untuk pengujian otomatis.
 Konfigurasi tetap mempertahankan AppData (chat, Project, Settings, dan database
 Engagement/policy); penghapusan data aplikasi bukan bagian shortcut.
 
+## Rilis 2.0.0 - Chat-First
+
+Satu Chat terpadu dengan kartu konfirmasi, Auto-RoE dalam satu transaksi, multi-tool,
+specialist agents, WhiteBox/GreyBox, grounding evidence pada Deep Analysis, dan Security
+Workspace sebagai dashboard riwayat. Endpoint eksekusi langsung dikunci (423). Detail di
+[CHAT_FIRST.md](CHAT_FIRST.md).
+
+Build, tes, smoke test backend terbungkus, checksum, dan catatan rilis dalam satu langkah:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1
+```
+
+Smoke test `scripts/smoke-windows-backend.py` kini memeriksa penguncian endpoint lama dan
+alur Chat-First (kartu konfirmasi -> Auto-RoE -> scan TCP loopback nyata -> evidence), sehingga
+Ollama dengan model reasoning harus aktif; gunakan `-SkipChatSmoke` bila tidak tersedia.
+Opsi smoke v1 (`JO_SMOKE_HEAD_TOOLS`, `JO_SMOKE_RECON`, dan lainnya) tidak berlaku di 2.0.
+Hasil aktual ditulis ke `desktop-app/dist/RELEASE-TESTS.txt` dan log ke `output/release-2.0.0/`.
+
 ## Rilis 1.13.0
 
 Tools & monitoring menambahkan profil Nuclei satu HEAD, ZAP passive headers

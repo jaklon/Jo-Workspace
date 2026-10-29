@@ -27,6 +27,7 @@ export interface WebImage {
   url: string
   alt: string
   source_url: string
+  ticket?: string
 }
 export interface Coverage {
   selected: number
@@ -38,6 +39,21 @@ export interface Proposal {
   path: string
   diff: string
   state?: 'applied' | 'rejected'
+}
+export interface ActionProposal {
+  id: string
+  intent: string
+  target: string
+  tools: string[]
+  duration: string
+  summary: string
+  ports?: number[]
+  environment?: string
+  account_refs?: string[]
+  owner_json_pointer?: string
+  project_id?: string
+  project_is_new?: boolean
+  state?: 'submitted' | 'cancelled'
 }
 export interface AnalysisProgress {
   step: string
@@ -72,6 +88,7 @@ export interface Message {
   webImages?: WebImage[]
   coverage?: Coverage
   proposals?: Proposal[]
+  action?: ActionProposal
 }
 export interface ChatSession {
   id: string
@@ -93,7 +110,8 @@ export interface Project {
 export type ChatSessionMap = Record<TabType, ChatSession[]>
 export type ActiveSessionMap = Record<TabType, string>
 export interface StreamEvent {
-  type: 'status' | 'token' | 'attachment' | 'sources' | 'result' | 'error' | 'done'
+  type:
+    'status' | 'token' | 'attachment' | 'sources' | 'result' | 'error' | 'done' | 'action_proposal'
   token?: string
   result?: string
   step?: string
@@ -103,6 +121,8 @@ export interface StreamEvent {
   sources?: Source[]
   images?: WebImage[]
   coverage?: Coverage
+  visual_analysis?: string | null
   proposals?: Proposal[]
+  action?: ActionProposal
   report?: PentestReport
 }

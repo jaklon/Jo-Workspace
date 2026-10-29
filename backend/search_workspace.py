@@ -13,7 +13,7 @@ from pydantic import Field
 from scrapling import Selector
 
 from engagements import StrictModel
-from security import SafeValidationRoute
+from security import SafeValidationRoute, valid_image_ticket
 from web_checks import resolve
 
 router = APIRouter(prefix='/api/search', tags=['SearXNG and Scrapling'], route_class=SafeValidationRoute)
@@ -185,6 +185,8 @@ async def extract(payload:ExtractQuery):
 
 
 @router.get('/image')
-async def image(url:str):
+async def image(url:str, ticket:str, request:Request):
+    if not valid_image_ticket(request.state.api_token, url, ticket):
+        raise HTTPException(403, 'Gambar memerlukan persetujuan pencarian di chat.')
     body,media=await get_public(url,2_000_000,image=True)
     return Response(body,media_type=media,headers={'Cache-Control':'private, max-age=300','X-Content-Type-Options':'nosniff'})

@@ -116,13 +116,13 @@ export function WorkspaceSidebar({
         <div className="sidebar-actions">
           <button className="nav-item" onClick={onWebSearch}>
             <Search size={18} />
-            <span>Cari web & gambar</span>
-            <small>SearXNG</small>
+            <span>Cari web melalui chat</span>
+            <small>Chat</small>
           </button>
           <button className="nav-item" onClick={onSecurity}>
             <Folder size={18} />
             <span>Security Workspace</span>
-            <small>Tahap 7</small>
+            <small>Riwayat</small>
           </button>
           <button className="nav-item" onClick={onNewChat} disabled={disabled}>
             <SquarePen size={18} />

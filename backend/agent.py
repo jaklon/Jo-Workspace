@@ -6,7 +6,7 @@ from model_runtime import runtime, bounded_messages, token_upper_bound
 from tools import TOOL_DEFINITIONS, TOOL_RUNNERS, proposal_payload
 
 
-async def execute_agent_pipeline(user_prompt, max_iterations=5, *, store, session_id):
+async def execute_agent_pipeline(user_prompt, max_iterations=5, *, store, session_id, model_override=None):
     if not 1 <= max_iterations <= 8:
         raise ValueError("Jumlah iterasi harus 1–8.")
     system = ("Kamu engineer dengan tools read_file, list_dir dan propose_write di workspace. "
@@ -20,7 +20,7 @@ async def execute_agent_pipeline(user_prompt, max_iterations=5, *, store, sessio
             cost = token_upper_bound(json.dumps(messages, ensure_ascii=False)) + token_upper_bound(json.dumps(TOOL_DEFINITIONS)) + 512
             if cost > config.CONTEXT_TOKENS:
                 return {"status": "incomplete", "result": "Anggaran konteks agent tercapai. Persempit tugas; proposal tetap dapat ditinjau.", "proposals": proposals}
-            message = await runtime.chat(MODELS["coding"], messages, tools=TOOL_DEFINITIONS, output_tokens=384)
+            message = await runtime.chat(model_override or MODELS["coding"], messages, tools=TOOL_DEFINITIONS, output_tokens=384)
             calls = message.get("tool_calls") or []
             if not calls:
                 return {"status": "awaiting_approval" if proposals else "success", "result": message["content"] or "Tidak ada jawaban akhir dari model.", "proposals": proposals}

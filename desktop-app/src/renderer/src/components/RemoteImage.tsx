@@ -4,18 +4,23 @@ import { apiFetch } from '../lib/api'
 export function RemoteImage({
   url,
   alt,
-  style
+  style,
+  ticket
 }: {
   url: string
   alt: string
   style: CSSProperties
+  ticket?: string
 }): JSX.Element {
   const [src, setSrc] = useState('')
   const [error, setError] = useState(false)
   useEffect(() => {
     let active = true
     let objectUrl = ''
-    void apiFetch(`/api/search/image?url=${encodeURIComponent(url)}`)
+    if (!ticket) return
+    void apiFetch(
+      `/api/search/image?url=${encodeURIComponent(url)}&ticket=${encodeURIComponent(ticket)}`
+    )
       .then((response) => response.blob())
       .then((blob) => {
         if (!active) return
@@ -29,8 +34,8 @@ export function RemoteImage({
       active = false
       if (objectUrl) URL.revokeObjectURL(objectUrl)
     }
-  }, [url])
-  if (error) return <span className="muted-text">Gambar tidak dapat dimuat.</span>
+  }, [url, ticket])
+  if (!ticket || error) return <span className="muted-text">Gambar tidak dapat dimuat.</span>
   if (!src) return <span className="muted-text">Memuat gambar…</span>
   return <img src={src} alt={alt} style={style} loading="lazy" />
 }

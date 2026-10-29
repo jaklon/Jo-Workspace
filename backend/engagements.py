@@ -288,15 +288,19 @@ class EngagementStore:
         return [self.detail(project_id, eid, history=False) for eid in ids]
 
     def create(self, project_id, content):
+        with self.transaction() as db:
+            eid = self.create_in(db, project_id, content)
+        return self.detail(project_id, eid)
+
+    def create_in(self, db, project_id, content):
         eid, now = str(uuid4()), utc_now().isoformat()
         payload, digest = snapshot(content)
-        with self.transaction() as db:
-            if db.execute("SELECT COUNT(*) FROM engagements WHERE project_id=?", (project_id,)).fetchone()[0] >= 100:
-                raise HTTPException(409, "Batas 100 engagement per project tercapai.")
-            db.execute("INSERT INTO engagements VALUES (?,?,?,?,1)", (eid, project_id, now, now))
-            db.execute("INSERT INTO roe_versions(engagement_id,version,status,content,content_hash) VALUES (?,1,'draft',?,?)", (eid, payload, digest))
-            self.event(db, eid, 1, "created", "operator-lokal", "", digest)
-        return self.detail(project_id, eid)
+        if db.execute("SELECT COUNT(*) FROM engagements WHERE project_id=?", (project_id,)).fetchone()[0] >= 100:
+            raise HTTPException(409, "Batas 100 engagement per project tercapai.")
+        db.execute("INSERT INTO engagements VALUES (?,?,?,?,1)", (eid, project_id, now, now))
+        db.execute("INSERT INTO roe_versions(engagement_id,version,status,content,content_hash) VALUES (?,1,'draft',?,?)", (eid, payload, digest))
+        self.event(db, eid, 1, "created", "operator-lokal", "", digest)
+        return eid
 
     def edit(self, project_id, eid, payload):
         content, digest = snapshot(payload.content)
@@ -311,50 +315,53 @@ class EngagementStore:
 
     def decide(self, project_id, eid, decision):
         with self.transaction() as db:
-            _, head = self.head(db, project_id, eid, decision.expected_revision)
-            content = EngagementContent.model_validate_json(head["content"])
-            status, action, version = head["status"], decision.action, head["version"]
-            now = utc_now().isoformat()
-            if action == "submit":
-                if status != "draft":
-                    raise HTTPException(409, "Hanya draft yang dapat diajukan.")
-                errors = content.submission_errors()
-                if errors:
-                    raise HTTPException(422, {"message": "RoE belum lengkap.", "errors": errors})
-                db.execute("UPDATE roe_versions SET status='pending_review',submitted_at=? WHERE engagement_id=? AND version=?", (now, eid, version))
-            elif action in ("approve", "request_changes"):
-                if status != "pending_review":
-                    raise HTTPException(409, "Hanya RoE menunggu persetujuan yang dapat ditinjau.")
-                if content.ends_at and content.ends_at <= utc_now():
-                    raise HTTPException(409, "RoE telah kedaluwarsa. Buat revisi baru.")
-                if action == "approve" and content.submission_errors():
-                    raise HTTPException(422, {"message": "RoE tidak memenuhi policy terbaru; minta perbaikan dan buat revisi.", "errors": content.submission_errors()})
-                if not decision.acknowledge or not decision.note:
-                    raise HTTPException(422, "Pernyataan peninjau dan catatan keputusan wajib diisi.")
-                result = "approved" if action == "approve" else "revoked"
-                db.execute("UPDATE roe_versions SET status=?,reviewed_at=?,reviewer=?,review_note=? WHERE engagement_id=? AND version=?", (result, now, decision.actor_label, decision.note, eid, version))
-                if action == "request_changes":
-                    db.execute("UPDATE roe_versions SET revoked_at=?,revoke_note=? WHERE engagement_id=? AND version=?", (now, decision.note, eid, version))
-            elif action == "revoke":
-                if status == "revoked":
-                    raise HTTPException(409, "RoE sudah dicabut.")
-                if not decision.note:
-                    raise HTTPException(422, "Alasan pencabutan wajib diisi.")
-                db.execute("UPDATE roe_versions SET status='revoked',revoked_at=?,revoke_note=? WHERE engagement_id=? AND version=?", (now, decision.note, eid, version))
-            else:
-                if status == "draft":
-                    raise HTTPException(409, "Edit draft saat ini sebelum membuat revisi lain.")
-                if version >= 100:
-                    raise HTTPException(409, "Batas 100 versi RoE tercapai.")
-                if not decision.note:
-                    raise HTTPException(422, "Alasan revisi wajib diisi.")
-                if status != "revoked":
-                    db.execute("UPDATE roe_versions SET status='revoked',revoked_at=?,revoke_note=? WHERE engagement_id=? AND version=?", (now, "Digantikan revisi baru: " + decision.note, eid, version))
-                version += 1
-                db.execute("INSERT INTO roe_versions(engagement_id,version,status,content,content_hash) VALUES (?,?,'draft',?,?)", (eid, version, head["content"], head["content_hash"]))
-            self.event(db, eid, version, action, decision.actor_label, decision.note, head["content_hash"])
-            db.execute("UPDATE engagements SET revision=revision+1,updated_at=? WHERE id=?", (now, eid))
+            self.decide_in(db, project_id, eid, decision)
         return self.detail(project_id, eid)
+
+    def decide_in(self, db, project_id, eid, decision):
+        _, head = self.head(db, project_id, eid, decision.expected_revision)
+        content = EngagementContent.model_validate_json(head["content"])
+        status, action, version = head["status"], decision.action, head["version"]
+        now = utc_now().isoformat()
+        if action == "submit":
+            if status != "draft":
+                raise HTTPException(409, "Hanya draft yang dapat diajukan.")
+            errors = content.submission_errors()
+            if errors:
+                raise HTTPException(422, {"message": "RoE belum lengkap.", "errors": errors})
+            db.execute("UPDATE roe_versions SET status='pending_review',submitted_at=? WHERE engagement_id=? AND version=?", (now, eid, version))
+        elif action in ("approve", "request_changes"):
+            if status != "pending_review":
+                raise HTTPException(409, "Hanya RoE menunggu persetujuan yang dapat ditinjau.")
+            if content.ends_at and content.ends_at <= utc_now():
+                raise HTTPException(409, "RoE telah kedaluwarsa. Buat revisi baru.")
+            if action == "approve" and content.submission_errors():
+                raise HTTPException(422, {"message": "RoE tidak memenuhi policy terbaru; minta perbaikan dan buat revisi.", "errors": content.submission_errors()})
+            if not decision.acknowledge or not decision.note:
+                raise HTTPException(422, "Pernyataan peninjau dan catatan keputusan wajib diisi.")
+            result = "approved" if action == "approve" else "revoked"
+            db.execute("UPDATE roe_versions SET status=?,reviewed_at=?,reviewer=?,review_note=? WHERE engagement_id=? AND version=?", (result, now, decision.actor_label, decision.note, eid, version))
+            if action == "request_changes":
+                db.execute("UPDATE roe_versions SET revoked_at=?,revoke_note=? WHERE engagement_id=? AND version=?", (now, decision.note, eid, version))
+        elif action == "revoke":
+            if status == "revoked":
+                raise HTTPException(409, "RoE sudah dicabut.")
+            if not decision.note:
+                raise HTTPException(422, "Alasan pencabutan wajib diisi.")
+            db.execute("UPDATE roe_versions SET status='revoked',revoked_at=?,revoke_note=? WHERE engagement_id=? AND version=?", (now, decision.note, eid, version))
+        else:
+            if status == "draft":
+                raise HTTPException(409, "Edit draft saat ini sebelum membuat revisi lain.")
+            if version >= 100:
+                raise HTTPException(409, "Batas 100 versi RoE tercapai.")
+            if not decision.note:
+                raise HTTPException(422, "Alasan revisi wajib diisi.")
+            if status != "revoked":
+                db.execute("UPDATE roe_versions SET status='revoked',revoked_at=?,revoke_note=? WHERE engagement_id=? AND version=?", (now, "Digantikan revisi baru: " + decision.note, eid, version))
+            version += 1
+            db.execute("INSERT INTO roe_versions(engagement_id,version,status,content,content_hash) VALUES (?,?,'draft',?,?)", (eid, version, head["content"], head["content_hash"]))
+        self.event(db, eid, version, action, decision.actor_label, decision.note, head["content_hash"])
+        db.execute("UPDATE engagements SET revision=revision+1,updated_at=? WHERE id=?", (now, eid))
 
 
 router = APIRouter(prefix="/api/security", tags=["Security Workspace — planning only"])

@@ -1,6 +1,7 @@
 # Jo Workspace — panduan workspace desktop
 
-Jalankan `start-web.ps1 -SkipBuild` dari root proyek, lalu buka
+Jalankan backend dari folder `backend`
+(`.\venv\Scripts\python.exe -m uvicorn main:app --host 127.0.0.1 --port 8010`), lalu buka
 http://127.0.0.1:8010. Untuk aplikasi Electron, jalankan backend terlebih dahulu
 dan gunakan `npm run dev` dari folder `desktop-app`.
 

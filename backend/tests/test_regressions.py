@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import io
+import hashlib
 import json
 import os
 import sys
@@ -129,14 +131,29 @@ class DocumentTests(unittest.TestCase):
 
 class ApiTests(unittest.TestCase):
     def setUp(self):
-        self.client = TestClient(app).__enter__()
+        self.data_override = patch("main.DATA_DIR", TEST_DATA)
+        self.data_override.start()
+        self.client = TestClient(app, client=("127.0.0.1", 50000)).__enter__()
         self.headers = {"Authorization": "Bearer " + os.environ["AGENT_API_TOKEN"]}
 
     def tearDown(self):
         self.client.__exit__(None, None, None)
+        self.data_override.stop()
 
     def events(self, response):
         return [json.loads(line[5:]) for line in response.text.splitlines() if line.startswith("data:")]
+
+    def upload_document(self, name, content, prompt, session, model=None):
+        prepared = self.client.post('/api/chat/uploads/prepare', headers=self.headers, json={
+            'session_id':session, 'filename':name, 'size':len(content), 'sha256':hashlib.sha256(content).hexdigest(),
+            'prompt':prompt, 'model_override':model})
+        self.assertEqual(prepared.status_code, 200, prepared.text)
+        action_id = prepared.json()['action']['id']
+        confirmed = self.client.post('/api/chat/actions/'+action_id+'/confirm', headers=self.headers,
+                                     json={'session_id':session, 'approve':True})
+        self.assertEqual(self.events(confirmed)[-1]['type'], 'done')
+        return self.client.post('/api/chat/uploads/'+action_id+'/execute', headers=self.headers,
+                                data={'session_id':session}, files={'file':(name,content,'text/plain')})
 
     def test_auth_blocks_agent_and_chat(self):
         for path in ("/api/agent/run", "/api/chat", "/api/gpu-status", "/api/pentest/run", "/api/pentest/capabilities"):
@@ -150,6 +167,52 @@ class ApiTests(unittest.TestCase):
         assess.assert_not_called()
         self.assertFalse(self.client.app.state.pentest_lock.locked())
 
+    def test_legacy_execution_endpoints_require_chat_confirmation(self):
+        paths = ['/api/agent/run', '/api/agent/dispatch', '/api/document/parse', '/api/document/analyze-stream',
+                 '/api/vision/analyze', '/api/search/query', '/api/search/extract-images', '/api/agent/proposals/example',
+                 '/api/security/mcp/servers/00000000-0000-0000-0000-000000000001/check',
+                 '/api/security/projects/p/engagements/e/jobs/j/approve',
+                 '/api/security/projects/p/engagements/e/deep-analysis',
+                 '/api/security/projects/p/engagements/e/orchestrations',
+                 '/api/security/projects/p/engagements/e/orchestrations/r/approve',
+                 '/api/security/projects/p/engagements/e/agents/a/approve',
+                 '/api/security/projects/p/engagements/e/jobs/j/retry', '/api/pentest/run']
+        for path in paths:
+            with self.subTest(path=path):
+                self.assertEqual(self.client.post(path, headers=self.headers, json={}).status_code, 423)
+        response = self.client.post('/api/chat', headers=self.headers, json={'prompt':'Cari web', 'web_mode':'on'})
+        self.assertEqual(response.status_code, 423)
+
+    def test_upload_requires_matching_single_use_approval(self):
+        content = b'fixture file'
+        data = {'session_id':'upload-security','filename':'fixture.txt','size':len(content),
+                'sha256':hashlib.sha256(content).hexdigest(),'prompt':'Ringkas'}
+        action = self.client.post('/api/chat/uploads/prepare',headers=self.headers,json=data).json()['action']
+        path = '/api/chat/uploads/'+action['id']+'/execute'
+        def upload(value, session='upload-security'):
+            return self.client.post(path,headers=self.headers,data={'session_id':session},files={'file':('fixture.txt',value,'text/plain')})
+        self.assertEqual(upload(content).status_code, 400)
+        response = self.client.post('/api/chat/actions/'+action['id']+'/confirm',headers=self.headers,
+                                    json={'session_id':'upload-security','approve':True})
+        self.assertEqual(self.events(response)[-1]['type'], 'done')
+        self.assertEqual(upload(b'other file').status_code, 409)
+        self.assertEqual(upload(content,'wrong').status_code, 400)
+        with patch('services.runtime.chat',new=AsyncMock(return_value={'content':'OK'})):
+            self.assertEqual(self.events(upload(content))[-1]['type'], 'done')
+        self.assertEqual(upload(content).status_code, 400)
+
+    def test_chat_rejects_session_jwt_without_echoing_it(self):
+        claims = base64.urlsafe_b64encode(json.dumps({'sub':'a','aud':'fixture'}).encode()).decode().rstrip('=')
+        token = 'e30.' + claims + '.signature'
+        response = self.client.post('/api/chat',headers=self.headers,json={'prompt':'token '+token,'unified':True})
+        self.assertEqual(response.status_code, 422)
+        self.assertNotIn(token, response.text)
+
+    def test_unapproved_image_fetch_is_blocked(self):
+        url = 'https://example.test/image.png'
+        response = self.client.get('/api/search/image',headers=self.headers,params={'url':url,'ticket':'invalid'})
+        self.assertEqual(response.status_code, 403)
+
     def test_login_cookie_and_hostile_origin(self):
         response = self.client.post("/api/session", json={"token": os.environ["AGENT_API_TOKEN"]})
         self.assertEqual(response.status_code, 200)
@@ -160,18 +223,257 @@ class ApiTests(unittest.TestCase):
     def test_request_size_and_iteration_bounds(self):
         self.assertEqual(self.client.post("/api/chat", headers={**self.headers, "Content-Length": str(MAX_BODY+1)}, content="x").status_code, 413)
         for value in (-1, 0, 999):
-            self.assertEqual(self.client.post("/api/agent/run", headers=self.headers, json={"prompt": "x", "max_iterations": value}).status_code, 422)
+            self.assertEqual(self.client.post("/api/agent/run", headers=self.headers, json={"prompt": "x", "max_iterations": value}).status_code, 423)
 
     def test_vision_followup_error_is_clear(self):
         result = self.client.post("/api/chat", headers=self.headers, json={"prompt": "gambar tadi", "target": "vision"})
         self.assertEqual(result.status_code, 400)
         self.assertIn("Unggah gambar", result.json()["detail"])
 
+    def test_chat_model_override_applies_to_text_and_document(self):
+        async def chunks(model, messages, **kwargs):
+            self.assertEqual(model, "chosen:latest")
+            yield {"message": {"content": "OK"}}
+            yield {"done": True}
+        with patch("main.validate_model_override", new=AsyncMock()), \
+             patch("main.runtime.chunks", new=chunks), \
+             patch("services.runtime.chat", new=AsyncMock(return_value={"content": "OK"})) as chat:
+            response = self.client.post("/api/chat", headers=self.headers,
+                json={"prompt": "test", "model_override": "chosen:latest"})
+            self.assertEqual(self.events(response)[-1]["type"], "done")
+            response = self.upload_document("example.txt", b"Contoh.", "Ringkas", "override", "chosen:latest")
+            self.assertEqual(self.events(response)[-1]["type"], "done")
+            self.assertEqual(chat.await_args.args[0], "chosen:latest")
+
+    def test_unified_coding_waits_for_confirmation_and_rejects_replay(self):
+        with patch("main.classify", new=AsyncMock(return_value="coding")), \
+             patch("main.execute_agent_pipeline", new=AsyncMock(return_value={"result": "done", "proposals": []})) as agent:
+            response = self.client.post("/api/chat", headers=self.headers,
+                json={"prompt": "Periksa file workspace", "session_id": "unified-test", "unified": True})
+            events = self.events(response)
+            action = next(e["action"] for e in events if e["type"] == "action_proposal")
+            agent.assert_not_awaited()
+            path = "/api/chat/actions/" + action["id"] + "/confirm"
+            self.assertEqual(self.client.post(path, headers=self.headers,
+                json={"session_id": "wrong", "approve": True}).status_code, 400)
+            self.assertEqual(agent.await_count, 0)
+            approved = self.client.post(path, headers=self.headers,
+                json={"session_id": "unified-test", "approve": True})
+            self.assertEqual(self.events(approved)[-1]["type"], "done")
+            self.assertEqual(agent.await_count, 1)
+            self.assertEqual(self.client.post(path, headers=self.headers,
+                json={"session_id": "unified-test", "approve": True}).status_code, 400)
+            self.assertEqual(agent.await_count, 1)
+
+    def test_unified_tcp_confirm_runs_synthetic_job_and_analysis(self):
+        from chat_orchestrator import SecuritySlots
+        slots = SecuritySlots(tool="tcp-connect", target="192.0.2.4", ports=[443],
+                              environment="lab", assessment_mode="blackbox")
+        fake_result = {"tool": "tcp-connect", "target": "192.0.2.4", "ports": [{"port": 443, "status": "closed"}]}
+        output = {"summary": "Pemeriksaan selesai. Cookie sesi tanpa flag HttpOnly ditemukan pada port 8080.",
+                  "observations": [{"statement": "Port 443 tertutup.", "evidence_quote": "closed"},
+                                   {"statement": "Nginx 1.24 rentan.", "evidence_quote": "nginx/1.24"}],
+                  "limitations": ["Fixture sintetis"], "recommendations": ["Aktifkan HSTS."]}
+        with patch("main.classify", new=AsyncMock(return_value="security")), \
+             patch("main.security_slots", new=AsyncMock(return_value=slots)), \
+             patch("bounded_scan.run_scan", new=AsyncMock(return_value=fake_result)) as scanner, \
+             patch("deep_analysis.installed_models", new=AsyncMock(return_value=[{"name": "security-test", "digest": "synthetic"}])), \
+             patch("deep_analysis.runtime.chat", new=AsyncMock(return_value={"content": json.dumps(output), "tool_calls": []})):
+            from config import MODELS
+            with patch.dict(MODELS, {"security": "security-test"}):
+                response = self.client.post("/api/chat", headers=self.headers, json={
+                    "prompt": "Scan 192.0.2.4 port 443 lab blackbox", "session_id": "tcp-test",
+                    "project_id": "89de83d0-8729-4b0a-b21d-9fcafc444095", "unified": True})
+                action = next(e["action"] for e in self.events(response) if e["type"] == "action_proposal")
+                scanner.assert_not_awaited()
+                response = self.client.post("/api/chat/actions/" + action["id"] + "/confirm", headers=self.headers,
+                    json={"session_id": "tcp-test", "approve": True})
+                events = self.events(response)
+                self.assertEqual(events[-1]["type"], "done", events)
+                report = next(e["result"] for e in events if e["type"] == "result")
+                self.assertIn("Pemeriksaan selesai", report)
+                self.assertIn("Port 443 tertutup", report)
+                claims = report.split("**Keterbatasan**")[0]
+                for hallucinated in ("HttpOnly", "8080", "Nginx"):
+                    self.assertNotIn(hallucinated, claims)
+                self.assertNotIn("**Rekomendasi**", report)
+                self.assertIn("3 pernyataan model dihapus", report)
+                self.assertEqual(scanner.await_count, 1)
+
+    def test_unified_web_waits_for_confirmation(self):
+        web = {"messages": [{"role": "user", "content": "fixture"}], "sources": [], "images": []}
+        async def chunks(model, messages, **kwargs):
+            yield {"message": {"content": "Hasil sintetis"}}
+            yield {"done": True}
+        with patch("main.classify", new=AsyncMock(return_value="web")), \
+             patch("main.web_context", new=AsyncMock(return_value=web)) as search, \
+             patch("main.runtime.chunks", new=chunks):
+            response = self.client.post("/api/chat", headers=self.headers,
+                json={"prompt": "Cari web", "session_id": "web-test", "unified": True, "web_mode": "auto"})
+            action = next(e["action"] for e in self.events(response) if e["type"] == "action_proposal")
+            search.assert_not_awaited()
+            response = self.client.post("/api/chat/actions/" + action["id"] + "/confirm", headers=self.headers,
+                json={"session_id": "web-test", "approve": True})
+            self.assertEqual(self.events(response)[-1]["type"], "done")
+            search.assert_awaited_once()
+
+    def test_unified_multi_tool_runs_confirmed_jobs(self):
+        from chat_orchestrator import SecuritySlots, ToolSelection
+        from config import MODELS
+        slots = SecuritySlots(environment="lab", assessment_mode="blackbox", selections=[
+            ToolSelection(tool="tcp-connect", target="192.0.2.4", ports=[443]),
+            ToolSelection(tool="http-head", target="https://example.test/")])
+        output = {"summary": "Selesai", "observations": ["Observasi"], "limitations": ["Fixture"], "recommendations": []}
+        with patch("main.classify", new=AsyncMock(return_value="security")), \
+             patch("main.security_slots", new=AsyncMock(return_value=slots)), \
+             patch("bounded_scan.run_scan", new=AsyncMock(return_value={"tool":"tcp-connect", "ports":[]})) as scanner, \
+             patch("web_checks.probe", new=AsyncMock(return_value={"http_status":200})) as web, \
+             patch("deep_analysis.installed_models", new=AsyncMock(return_value=[{"name":"security-test", "digest":"synthetic"}])), \
+             patch("deep_analysis.runtime.chat", new=AsyncMock(return_value={"content":json.dumps(output), "tool_calls":[]})), \
+             patch.dict(MODELS, {"security":"security-test"}):
+            response = self.client.post("/api/chat", headers=self.headers, json={"prompt":"Periksa TCP dan HEAD",
+                "session_id":"multi-test", "project_id":"89de83d0-8729-4b0a-b21d-9fcafc444095", "unified":True})
+            action = next(e["action"] for e in self.events(response) if e["type"] == "action_proposal")
+            self.assertIn("tcp-connect", action["tools"])
+            self.assertIn("http-head", action["tools"])
+            scanner.assert_not_awaited(); web.assert_not_awaited()
+            response = self.client.post("/api/chat/actions/"+action["id"]+"/confirm", headers=self.headers,
+                json={"session_id":"multi-test", "approve":True})
+            events = self.events(response)
+            self.assertEqual(events[-1]["type"], "done", events)
+            result = next(e["result"] for e in events if e["type"] == "result")
+            self.assertEqual(result.count("Evidence:"), 2)
+            scanner.assert_awaited_once(); web.assert_awaited_once()
+
+    def test_unified_whitebox_and_greybox_analyze_imported_evidence(self):
+        from chat_orchestrator import SecuritySlots
+        from config import MODELS
+        output = {"summary": "Review selesai", "observations": ["Konfigurasi dibaca"],
+                  "limitations": ["Bukti impor"], "recommendations": []}
+        for mode, kind, alias in (("whitebox", "source_code", ""), ("greybox", "configuration", "account-a")):
+            with self.subTest(mode=mode):
+                session = "review-" + mode
+                attachment = self.client.app.state.store.add_attachment(session, "fixture.txt", "document", "example configuration")
+                slots = SecuritySlots(tool="document-review", target="example.test", environment="lab",
+                                      assessment_mode=mode, evidence_kind=kind, test_account_ref=alias)
+                with patch("main.classify", new=AsyncMock(return_value="security")), \
+                     patch("main.security_slots", new=AsyncMock(return_value=slots)), \
+                     patch("deep_analysis.installed_models", new=AsyncMock(return_value=[{"name": "security-test", "digest": "synthetic"}])), \
+                     patch("deep_analysis.runtime.chat", new=AsyncMock(return_value={"content": json.dumps(output), "tool_calls": []})), \
+                     patch.dict(MODELS, {"security": "security-test"}):
+                    response = self.client.post("/api/chat", headers=self.headers, json={"prompt": "Review " + mode,
+                        "session_id": session, "project_id": "89de83d0-8729-4b0a-b21d-9fcafc444095",
+                        "attachment_ids": [attachment["id"]], "unified": True})
+                    action = next(e["action"] for e in self.events(response) if e["type"] == "action_proposal")
+                    self.assertIn("fixture.txt", action["target"])
+                    response = self.client.post("/api/chat/actions/" + action["id"] + "/confirm", headers=self.headers,
+                        json={"session_id": session, "approve": True})
+                    events = self.events(response)
+                    self.assertEqual(events[-1]["type"], "done", events)
+                    result = next(e["result"] for e in events if e["type"] == "result")
+                    self.assertIn("Review selesai", result)
+                    self.assertIn("Ringkasan", result)
+                    self.assertIn("Evidence:", result)
+
+    def test_specialist_reviews_only_confirmed_evidence_and_is_archived(self):
+        from chat_orchestrator import SecuritySlots
+        from config import MODELS
+        session = "review-specialist"
+        attachment = self.client.app.state.store.add_attachment(session, "fixture.txt", "document", "example configuration")
+        slots = SecuritySlots(tool="document-review", target="example.test", environment="lab",
+                              assessment_mode="whitebox", evidence_kind="source_code", specialists=["web_api"])
+        output = {"summary": "Spesialis selesai", "observations": ["Bukti dibaca"],
+                  "limitations": ["Tidak ada koneksi baru"], "recommendations": []}
+        models = [{"name": "security-test:latest", "digest": "synthetic"}]
+        with patch("main.classify", new=AsyncMock(return_value="security")), \
+             patch("main.security_slots", new=AsyncMock(return_value=slots)), \
+             patch("deep_analysis.installed_models", new=AsyncMock(return_value=models)), \
+             patch("security_agents.installed_models", new=AsyncMock(return_value=models)), \
+             patch("deep_analysis.runtime.chat", new=AsyncMock(return_value={"content": json.dumps(output), "tool_calls": []})), \
+             patch.dict(MODELS, {"security": "security-test"}):
+            response = self.client.post("/api/chat", headers=self.headers, json={"prompt": "Review whitebox",
+                "session_id": session, "project_id": "89de83d0-8729-4b0a-b21d-9fcafc444095",
+                "attachment_ids": [attachment["id"]], "unified": True})
+            action = next(e["action"] for e in self.events(response) if e["type"] == "action_proposal")
+            self.assertIn("Spesialis web_api (review evidence)", action["tools"])
+            response = self.client.post("/api/chat/actions/" + action["id"] + "/confirm", headers=self.headers,
+                json={"session_id": session, "approve": True})
+            events = self.events(response)
+            self.assertEqual(events[-1]["type"], "done", events)
+            self.assertIn("Spesialis web_api", next(e["result"] for e in events if e["type"] == "result"))
+            engagements = self.client.get("/api/security/projects/89de83d0-8729-4b0a-b21d-9fcafc444095/engagements", headers=self.headers).json()["items"]
+            eid = next(item["id"] for item in engagements if any(version["content"]["authorization_ref"] == "CHAT-APPROVED-" + session for version in item["versions"]))
+            records = self.client.get(f"/api/security/projects/89de83d0-8729-4b0a-b21d-9fcafc444095/engagements/{eid}/evidence-specialists", headers=self.headers).json()["items"]
+            self.assertEqual(records[0]["role"], "web_api")
+            self.assertEqual(records[0]["execution"], "evidence_review_only")
+
+    def test_local_monitoring_whitebox_uses_recorded_evidence(self):
+        from chat_orchestrator import SecuritySlots
+        from config import MODELS
+        slots = SecuritySlots(tool="monitoring-local", target="127.0.0.1", environment="lab", assessment_mode="whitebox")
+        result = {"tool":"monitoring-local", "target":"127.0.0.1", "services":[]}
+        output = {"summary":"Snapshot selesai", "observations":["Data sintetis"], "limitations":["Fixture"], "recommendations":[]}
+        with patch("main.classify", new=AsyncMock(return_value="security")), \
+             patch("main.security_slots", new=AsyncMock(return_value=slots)), \
+             patch("local_monitoring.snapshot", new=AsyncMock(return_value=result)) as monitoring, \
+             patch("deep_analysis.installed_models", new=AsyncMock(return_value=[{"name":"security-test", "digest":"synthetic"}])), \
+             patch("deep_analysis.runtime.chat", new=AsyncMock(return_value={"content":json.dumps(output),"tool_calls":[]})), \
+             patch.dict(MODELS, {"security":"security-test"}):
+            response = self.client.post("/api/chat", headers=self.headers, json={"prompt":"Monitoring lokal WhiteBox lab",
+                "session_id":"monitor-test", "project_id":"89de83d0-8729-4b0a-b21d-9fcafc444095", "unified":True})
+            action = next(e["action"] for e in self.events(response) if e["type"] == "action_proposal")
+            monitoring.assert_not_awaited()
+            response = self.client.post("/api/chat/actions/"+action["id"]+"/confirm", headers=self.headers,
+                json={"session_id":"monitor-test", "approve":True})
+            events = self.events(response)
+            self.assertEqual(events[-1]["type"], "done", events)
+            self.assertIn("Snapshot selesai", next(e["result"] for e in events if e["type"] == "result"))
+            monitoring.assert_awaited_once()
+
+    def test_greybox_two_sessions_are_confirmed_ephemeral_and_bound(self):
+        from chat_orchestrator import SecuritySlots
+        from config import MODELS
+        def token(subject):
+            payload = base64.urlsafe_b64encode(json.dumps({"sub": subject, "aud": "fixture"}).encode()).decode().rstrip('=')
+            return "e30." + payload + ".signature"
+        tokens = [token("account-a"), token("account-b")]
+        slots = SecuritySlots(tool="auth-two-session", target="https://example.test/api", environment="staging",
+                              assessment_mode="greybox", account_refs=["qa-a", "qa-b"])
+        observed = [{"http_status":401,"redirect_observed":False}, {"http_status":200,"redirect_observed":False},
+                    {"http_status":403,"redirect_observed":False}]
+        output = {"summary":"Analisis selesai", "observations":["Status diamati"], "limitations":["Fixture"], "recommendations":[]}
+        with patch("main.classify", new=AsyncMock(return_value="security")), \
+             patch("main.security_slots", new=AsyncMock(return_value=slots)), \
+             patch("web_checks.probe", new=AsyncMock(side_effect=observed)) as probe, \
+             patch("deep_analysis.installed_models", new=AsyncMock(return_value=[{"name":"security-test", "digest":"synthetic"}])), \
+             patch("deep_analysis.runtime.chat", new=AsyncMock(return_value={"content":json.dumps(output), "tool_calls":[]})), \
+             patch.dict(MODELS, {"security":"security-test"}):
+            response = self.client.post("/api/chat", headers=self.headers, json={"prompt":"Bandingkan dua sesi GreyBox",
+                "session_id":"auth-test", "project_id":"89de83d0-8729-4b0a-b21d-9fcafc444095", "unified":True})
+            action = next(e["action"] for e in self.events(response) if e["type"] == "action_proposal")
+            self.assertEqual(action["account_refs"], ["qa-a", "qa-b"])
+            probe.assert_not_awaited()
+            path = "/api/chat/actions/" + action["id"] + "/confirm"
+            bad = self.client.post(path, headers=self.headers, json={"session_id":"auth-test", "approve":True, "session_tokens":[tokens[0],tokens[0]]})
+            self.assertEqual(bad.status_code, 422)
+            self.assertNotIn(tokens[0], bad.text)
+            probe.assert_not_awaited()
+            response = self.client.post(path, headers=self.headers, json={"session_id":"auth-test", "approve":True, "session_tokens":tokens})
+            events = self.events(response)
+            self.assertEqual(events[-1]["type"], "done", events)
+            self.assertEqual(probe.await_count, 3)
+            self.assertEqual([call.kwargs['bearer'] for call in probe.await_args_list], [None, *tokens])
+            for secret in tokens:
+                self.assertNotIn(secret, response.text)
+            self.assertFalse(self.client.app.state.jobs.sessions.entries)
+            for path in (self.client.app.state.store.path, self.client.app.state.engagements.path):
+                raw = path.read_bytes()
+                for secret in tokens:
+                    self.assertNotIn(secret.encode(), raw)
+
     def test_document_followup_retains_source_and_session_scope(self):
         with patch("services.runtime.chat", new=AsyncMock(return_value={"content": "ORBIT"})):
-            upload = self.client.post("/api/document/analyze-stream", headers=self.headers,
-                data={"prompt": "Nama proyek?", "session_id": "session-a"},
-                files={"file": ("qa.txt", b"Proyek: ORBIT.\nGudang: CENDANA-58.", "text/plain")})
+            upload = self.upload_document("qa.txt", b"Proyek: ORBIT.\nGudang: CENDANA-58.", "Nama proyek?", "session-a")
         events = self.events(upload)
         attachment = next(e["attachment"] for e in events if e["type"] == "attachment")
         async def chunks(model, messages, **kwargs):
@@ -206,27 +508,31 @@ class ApiTests(unittest.TestCase):
                             'url': 'https://example.com/story', 'text': 'Cuplikan'}],
                'images': [{'url': 'https://example.com/image.png', 'alt': 'Foto',
                            'source_url': 'https://example.com/story'}], 'coverage': None}
-        with patch('main.web_context', new=AsyncMock(return_value=web)):
+        with patch('main.web_context', new=AsyncMock(return_value=web)), patch('main.classify', new=AsyncMock(return_value='web')):
             with patch('main.runtime.chunks', new=chunks):
                 response = self.client.post('/api/chat', headers=self.headers,
-                    json={'prompt': 'Cari gambar', 'web_mode': 'on'})
+                    json={'prompt': 'Cari gambar', 'web_mode': 'on', 'unified':True, 'session_id':'web-citations'})
+                action = next(item['action'] for item in self.events(response) if item['type']=='action_proposal')
+                response = self.client.post('/api/chat/actions/'+action['id']+'/confirm', headers=self.headers,
+                    json={'session_id':'web-citations','approve':True})
         events = self.events(response)
-        sources = next(item for item in events if item['type'] == 'sources')
         result = next(item for item in events if item['type'] == 'result')
-        self.assertEqual(len(sources['images']), 1)
+        self.assertTrue(result['images'][0]['ticket'])
         self.assertEqual(result['images'][0]['alt'], 'Foto')
         self.assertIn('[1](https://example.com/story)', result['result'])
 
     def test_dispatch_vision_calls_image_pipeline(self):
         with patch("main.vision_result", new=AsyncMock(return_value={"result": "vision seen"})) as handler:
             response = self.client.post("/api/agent/dispatch", headers=self.headers, data={"prompt": "describe"}, files={"file": ("x.png", b"test", "image/png")})
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["result"], "vision seen")
-        handler.assert_awaited_once()
+        self.assertEqual(response.status_code, 423)
+        handler.assert_not_awaited()
 
     def test_proposal_session_and_replay(self):
         proposal = self.client.app.state.store.propose("session-p", tools.proposal_payload("new-proposal-test.txt", "safe test"))
-        path = "/api/agent/proposals/"+proposal["id"]
+        action = self.client.app.state.store.propose_chat_action('session-p', {'intent':'coding'})
+        self.client.app.state.store.decide_chat_action(action['id'], 'session-p', True)
+        self.client.app.state.store.authorize_code_proposals('session-p', action['id'], [proposal['id']])
+        path = "/api/chat/code-proposals/"+proposal["id"]+"/confirm"
         self.assertEqual(self.client.post(path, headers=self.headers, json={"session_id":"wrong", "approve":False}).status_code, 400)
         self.assertEqual(self.client.post(path, headers=self.headers, json={"session_id":"session-p", "approve":False}).status_code, 200)
         self.assertEqual(self.client.post(path, headers=self.headers, json={"session_id":"session-p", "approve":True}).status_code, 400)

@@ -3,6 +3,7 @@ import hmac
 import os
 import secrets
 import time
+import re
 from http.cookies import SimpleCookie
 from starlette.responses import JSONResponse
 from fastapi import HTTPException
@@ -91,6 +92,8 @@ class ApiBoundary:
                 self.login_attempts.append(now)
         elif not authenticated:
             return await deny(401, "Masukkan token akses Jo Workspace untuk terhubung.")
+        if legacy_execution_blocked(scope['path'], scope['method']):
+            return await deny(423, 'Eksekusi hanya tersedia setelah persetujuan rencana di chat.')
         try:
             length = int(headers.get(b"content-length", b"0"))
         except ValueError:
@@ -117,3 +120,34 @@ class ApiBoundary:
         scope.setdefault("state", {})["api_token"] = self.token
         scope["state"]["authenticated"] = authenticated
         return await self.app(scope, bounded_receive, send)
+
+
+def legacy_execution_blocked(path, method):
+    if method == 'GET' and (path == '/api/pentest/capabilities' or re.fullmatch(r'/api/security/projects/[^/]+/engagements/[^/]+/deep-analysis/capabilities', path)):
+        return True
+    if method != 'POST':
+        return False
+    if path in {'/api/agent/run', '/api/agent/dispatch', '/api/document/parse',
+                '/api/document/analyze-stream', '/api/vision/analyze', '/api/search/query',
+                '/api/search/extract-images', '/api/pentest/run'}:
+        return True
+    patterns = (r'/api/agent/proposals/[^/]+', r'/api/security/mcp/servers/[^/]+/check',
+                r'/api/security/projects/[^/]+/engagements/[^/]+/jobs(?:/[^/]+/(?:approve|retry))?',
+                r'/api/security/projects/[^/]+/engagements/[^/]+/deep-analysis',
+                r'/api/security/projects/[^/]+/engagements/[^/]+/orchestrations(?:/[^/]+/(?:approve|resume))?',
+                r'/api/security/projects/[^/]+/engagements/[^/]+/agents/[^/]+/(?:approve|resume)')
+    return any(re.fullmatch(pattern, path) for pattern in patterns)
+
+
+def image_ticket(token, url, expires):
+    message = f'image\n{expires}\n{url}'.encode('utf-8')
+    return str(expires) + '.' + hmac.new(token.encode(), message, hashlib.sha256).hexdigest()
+
+
+def valid_image_ticket(token, url, ticket):
+    try:
+        expiry, _ = ticket.split('.', 1)
+        expires = int(expiry)
+        return int(time.time()) < expires <= int(time.time()) + 900 and hmac.compare_digest(ticket, image_ticket(token, url, expires))
+    except (ValueError, TypeError):
+        return False

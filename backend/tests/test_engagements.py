@@ -28,6 +28,9 @@ def complete_content():
 
 class EngagementApiTests(unittest.TestCase):
     def setUp(self):
+        # Exercise legacy stores/routes independently; chat-only gate is covered by dedicated API tests.
+        self.legacy_gate = patch('security.legacy_execution_blocked', return_value=False)
+        self.legacy_gate.start()
         self.directory = tempfile.TemporaryDirectory(prefix="roe-tests-")
         self.data = Path(self.directory.name)
         self.override = patch("main.DATA_DIR", self.data)
@@ -41,6 +44,7 @@ class EngagementApiTests(unittest.TestCase):
         self.client.__exit__(None, None, None)
         self.override.stop()
         self.directory.cleanup()
+        self.legacy_gate.stop()
 
     def create(self, content=None):
         response = self.client.post(self.base, headers=self.headers, json={"content": content or complete_content()})

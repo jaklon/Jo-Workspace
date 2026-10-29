@@ -1,6 +1,6 @@
 {
   "name": "agent-os",
-  "version": "1.16.0",
+  "version": "2.0.0",
   "description": "Jo Workspace - personal local AI workspace powered by Ollama",
   "main": "./out/main/index.js",
   "author": "Jo Workspace",

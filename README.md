@@ -59,6 +59,7 @@ cakupan penyimpanan, cadangan, batasan, dan pintasan.
 
 ## Fitur Utama
 
+- 🧭 **Chat-First Unified Orchestrator**: satu Chat untuk teks, lampiran, coding, web, dan pemeriksaan keamanan. LLM memilih tool, bertanya balik bila parameter kurang, lalu menampilkan kartu **Setuju & Jalankan**; Auto-RoE, job, evidence, dan Deep Analysis berjalan otomatis setelah konfirmasi (lihat [CHAT_FIRST.md](CHAT_FIRST.md)).
 - 💬 **Multi-Turn Reasoning & Chat**: Percakapan berbasis LLM lokal berbobot tinggi untuk konsultasi logika kompleks dan pemecahan masalah.
 - 💻 **Autonomous Coding Agent (Human-in-the-Loop)**:
   - Agen mampu membaca struktur dan berkas di dalam direktori `workspace`.
@@ -99,6 +100,8 @@ Pastikan perangkat Anda telah memenuhi spesifikasi dan dependensi berikut:
      ollama pull qwen3.8-heretic-q4
      ollama pull minicpm-v:latest
      ```
+   - *(Opsional)* Model security **WhiteRabbitNeo V3 7B** dari file GGUF lokal:
+     `powershell -ExecutionPolicy Bypass -File scripts\install-whiterabbitneo.ps1` (lihat [CHAT_FIRST.md](CHAT_FIRST.md#model-per-tugas)).
 5. **Security Workspace tahap 7** tidak memerlukan Nmap; seluruh eksekusi pentest dinonaktifkan.
 6. *(Opsional)* **Tailscale**: Jika ingin mengakses Web UI dari perangkat lain melalui jaringan privat.
 
@@ -167,28 +170,25 @@ cd ..
 
 ## Cara Menjalankan
 
-### 1. Menjalankan Web UI (Rekomendasi)
+### 1. Menjalankan Web UI
 
-Cara termudah dan paling praktis untuk menjalankan aplikasi secara penuh:
+Cara yang disarankan untuk pemakaian sehari-hari adalah installer Windows
+(`desktop-app/dist/Jo-Workspace-<versi>-Windows-x64-Setup.exe`, lihat
+[WINDOWS_INSTALLER.md](WINDOWS_INSTALLER.md)). Untuk menjalankan Web UI langsung
+dari source:
 
-```powershell
-.\start-web.ps1
-```
-
-Script ini akan secara otomatis:
-1. Memeriksa kesiapan virtual environment Python backend.
-2. Membangun aset web frontend terbaru menggunakan `npm run build` di dalam `desktop-app`.
-3. Menjalankan server Uvicorn (FastAPI) pada `http://127.0.0.1:8010`.
-
-**Opsi Parameter Script `start-web.ps1`:**
-- Melewati tahap build frontend jika tidak ada perubahan kode (startup lebih cepat):
-  ```powershell
-  .\start-web.ps1 -SkipBuild
-  ```
-- Menjalankan di port khusus:
-  ```powershell
-  .\start-web.ps1 -Port 8020
-  ```
+1. Bangun aset web frontend (lewati jika tidak ada perubahan kode frontend):
+   ```powershell
+   cd desktop-app
+   npm run build
+   cd ..
+   ```
+2. Jalankan backend FastAPI; backend otomatis menyajikan `desktop-app/out/renderer`:
+   ```powershell
+   cd backend
+   .\venv\Scripts\python.exe -m uvicorn main:app --host 127.0.0.1 --port 8010
+   ```
+   Ganti `--port` untuk memakai port lain.
 
 **Langkah Masuk (Login):**
 1. Buka browser di `http://127.0.0.1:8010`.
@@ -249,7 +249,7 @@ Untuk mengintegrasikan model Jo Workspace langsung ke dalam alur kerja editor Vi
 Anda dapat mengakses antarmuka Web UI dari perangkat seluler (seperti iPhone atau Android) tanpa perlu mengekspos port ke internet publik:
 
 1. Pastikan Tailscale telah terpasang dan aktif di komputer host serta perangkat mobile Anda.
-2. Jalankan `start-web.ps1` di laptop/PC.
+2. Jalankan Web UI di laptop/PC pada port 8010 (lihat bagian 1 di atas).
 3. Di jendela PowerShell terpisah, aktifkan penerusan Tailscale Serve:
    ```powershell
    .\enable-tailscale-serve.ps1
@@ -334,7 +334,6 @@ ai-agent-workspace/
 ├── data/runtime/             # Direktori data sementara, token, dan lampiran (diabaikan Git)
 ├── workspace/                # Direktori kerja aman yang dikelola agen
 ├── scripts/                  # Skrip pembantu verifikasi stream SSE
-├── start-web.ps1             # Skrip otomatis untuk build & start Web UI
 ├── enable-tailscale-serve.ps1# Skrip konfigurasi akses jarak jauh Tailscale
 ├── REMOTE_ACCESS.md          # Panduan akses jarak jauh dari perangkat seluler
 └── SECURITY_PENTEST.md       # Panduan detail pengujian lab keamanan

@@ -504,6 +504,9 @@ kbd {
   color: var(--accent);
   white-space: nowrap;
 }
+.welcome-panel {
+  justify-content: safe center;
+}
 .welcome-symbol {
   background: var(--raised);
   color: var(--accent);
@@ -1438,6 +1441,13 @@ kbd {
   .setting-control {
     max-width: 48%;
   }
+  .setting-control kbd {
+    display: inline-block;
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    text-align: right;
+  }
   .connection-indicator {
     display: none;
   }
@@ -1511,6 +1521,29 @@ kbd {
   }
   .composer-area > div:last-child > span:last-child {
     display: none;
+  }
+}
+@media (max-width: 420px) {
+  .header-actions {
+    flex-shrink: 0;
+  }
+  .model-picker {
+    flex: 1;
+  }
+  .model-picker > span:first-child {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .model-picker select {
+    flex-shrink: 0;
+    max-width: 85px;
+  }
+  .setting-row {
+    flex-wrap: wrap;
+  }
+  .setting-control {
+    max-width: 100%;
   }
 }
 @media (prefers-reduced-motion: reduce) {

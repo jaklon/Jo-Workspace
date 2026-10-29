@@ -19,6 +19,8 @@ class ChatPayload(BaseModel):
     session_id: str = Field(default="default", min_length=1, max_length=100)
     web_mode: Literal["auto", "on", "off"] = "off"
     project_id: UUID | None = None
+    model_override: str | None = Field(default=None, min_length=1, max_length=120, pattern=r"^[\w.\-/:]+$")
+    unified: bool = False
 
 
 class AgentPayload(BaseModel):

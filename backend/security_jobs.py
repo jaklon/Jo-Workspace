@@ -237,49 +237,52 @@ class JobStore:
         return [PolicyProposal.model_validate({**step, "expected_revision": plan["expected_roe_revision"], "roe_version": plan["roe_version"], "content_hash": plan["content_hash"]}) for step in plan["steps"]]
 
     def approve(self, project, eid, jid, payload):
+        with self.engagements.transaction() as db:
+            self.approve_in(db, project, eid, jid, payload)
+        return self.detail(project, eid, jid)
+
+    def approve_in(self, db, project, eid, jid, payload):
         if not payload.acknowledge:
             raise HTTPException(422, "Konfirmasi persetujuan terhadap rencana dan adapter yang dipilih diperlukan.")
-        with self.engagements.transaction() as db:
-            row = self.job(db, project, eid, jid, payload.expected_revision)
-            if row["status"] != "awaiting_approval":
-                raise HTTPException(409, "Hanya job menunggu persetujuan yang dapat diantrekan.")
-            self.open_gate(db, eid)
-            plan = json.loads(row["plan"])
-            try:
-                validate_plan(plan)
-                validate_scan(plan)
-            except ValueError as exc: raise HTTPException(422,str(exc)) from exc
-            if digest(plan) != row["plan_hash"]:
-                raise HTTPException(409, "Integritas rencana job tidak sesuai.")
-            engagement, head = self.engagements.head(db, project, eid)
-            content = EngagementContent.model_validate_json(head["content"])
-            denials = []
-            for index, proposal in enumerate(self.proposals(plan)):
-                report = evaluate(content, head, engagement, proposal, self.clock(), dns_pinning=uses_pinned_url(plan))
-                if report["decision"] != "pass":
-                    denials.append(f"Langkah {index + 1}: " + ", ".join(check["code"] for check in report["checks"] if not check["passed"]))
-            if plan["wall_timeout_seconds"] > content.max_duration_minutes * 60:
-                denials.append("Durasi job melampaui batas RoE.")
-            if denials:
-                raise HTTPException(422, {"message": "Job ditolak policy sebelum antrean. Perbaiki rencana atau buat salinan dengan RoE terkini.", "errors": denials})
-            if plan.get('mcp'):
-                if self.gateway is None:raise HTTPException(503,'MCP gateway belum siap.')
-                self.gateway.validate(db,plan)
-            if not self.worker_active(db):
-                raise HTTPException(503, "Worker offline belum siap. Tunggu sebentar lalu coba lagi.")
-            comparison=(plan.get('scan') or {}).get('tool')=='auth-two-session'
-            if comparison:
-                if not payload.session_tokens:raise HTTPException(422,'Dua sesi uji sementara diperlukan untuk perbandingan.')
-                if any(ref not in content.test_account_refs for ref in plan['scan']['account_refs']):
-                    raise HTTPException(422,'Kedua alias harus tercatat dalam RoE.')
-                try:self.sessions.put(jid,[token.get_secret_value() for token in payload.session_tokens])
-                except ValueError as exc:raise HTTPException(409,str(exc)) from exc
-            elif payload.session_tokens:
-                raise HTTPException(422,'Sesi uji hanya untuk perbandingan dua akun.')
-            now = self.clock().isoformat()
-            db.execute("UPDATE security_jobs SET status='queued',revision=revision+1,updated_at=?,approved_at=?,approver=?,approval_note=? WHERE id=?", (now, now, payload.actor_label, payload.note, jid))
-            self.event(db, jid, "approved", payload.actor_label, payload.note)
-        return self.detail(project, eid, jid)
+        row = self.job(db, project, eid, jid, payload.expected_revision)
+        if row["status"] != "awaiting_approval":
+            raise HTTPException(409, "Hanya job menunggu persetujuan yang dapat diantrekan.")
+        self.open_gate(db, eid)
+        plan = json.loads(row["plan"])
+        try:
+            validate_plan(plan)
+            validate_scan(plan)
+        except ValueError as exc: raise HTTPException(422,str(exc)) from exc
+        if digest(plan) != row["plan_hash"]:
+            raise HTTPException(409, "Integritas rencana job tidak sesuai.")
+        engagement, head = self.engagements.head(db, project, eid)
+        content = EngagementContent.model_validate_json(head["content"])
+        denials = []
+        for index, proposal in enumerate(self.proposals(plan)):
+            report = evaluate(content, head, engagement, proposal, self.clock(), dns_pinning=uses_pinned_url(plan))
+            if report["decision"] != "pass":
+                denials.append(f"Langkah {index + 1}: " + ", ".join(check["code"] for check in report["checks"] if not check["passed"]))
+        if plan["wall_timeout_seconds"] > content.max_duration_minutes * 60:
+            denials.append("Durasi job melampaui batas RoE.")
+        if denials:
+            raise HTTPException(422, {"message": "Job ditolak policy sebelum antrean. Perbaiki rencana atau buat salinan dengan RoE terkini.", "errors": denials})
+        if plan.get('mcp'):
+            if self.gateway is None:raise HTTPException(503,'MCP gateway belum siap.')
+            self.gateway.validate(db,plan)
+        if not self.worker_active(db):
+            raise HTTPException(503, "Worker offline belum siap. Tunggu sebentar lalu coba lagi.")
+        comparison=(plan.get('scan') or {}).get('tool')=='auth-two-session'
+        if comparison:
+            if not payload.session_tokens:raise HTTPException(422,'Dua sesi uji sementara diperlukan untuk perbandingan.')
+            if any(ref not in content.test_account_refs for ref in plan['scan']['account_refs']):
+                raise HTTPException(422,'Kedua alias harus tercatat dalam RoE.')
+            try:self.sessions.put(jid,[token.get_secret_value() for token in payload.session_tokens])
+            except ValueError as exc:raise HTTPException(409,str(exc)) from exc
+        elif payload.session_tokens:
+            raise HTTPException(422,'Sesi uji hanya untuk perbandingan dua akun.')
+        now = self.clock().isoformat()
+        db.execute("UPDATE security_jobs SET status='queued',revision=revision+1,updated_at=?,approved_at=?,approver=?,approval_note=? WHERE id=?", (now, now, payload.actor_label, payload.note, jid))
+        self.event(db, jid, "approved", payload.actor_label, payload.note)
 
     def finish(self, db, row, status, code=None, message=None, actor="system"):
         self.sessions.discard(row["id"])

@@ -102,3 +102,4 @@ output/security-stage7/
 deploy/searxng/runtime/
 deploy/monitoring/runtime/
 output/amass-source/
+deploy/whiterabbitneo/Modelfile.generated
