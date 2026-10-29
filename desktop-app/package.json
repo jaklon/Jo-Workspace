@@ -1,11 +1,11 @@
 {
-  "name": "desktop-app",
-  "version": "1.0.0",
-  "description": "An Electron application with React and TypeScript",
+  "name": "agent-os",
+  "version": "1.16.0",
+  "description": "Jo Workspace - personal local AI workspace powered by Ollama",
   "main": "./out/main/index.js",
-  "author": "example.com",
-  "homepage": "https://electron-vite.org",
+  "author": "Jo Workspace",
   "scripts": {
+    "test": "node ../scripts/test-streams.mjs && node ../scripts/test-workspace.mjs && node ../scripts/test-engagements.mjs && node ../scripts/test-orchestration-ui.mjs && node ../scripts/test-agents-ui.mjs",
     "format": "prettier --write .",
     "lint": "eslint --cache .",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json --composite false",
@@ -15,8 +15,9 @@
     "dev": "electron-vite dev",
     "build": "npm run typecheck && electron-vite build",
     "postinstall": "electron-builder install-app-deps",
-    "build:unpack": "npm run build && electron-builder --dir",
-    "build:win": "npm run build && electron-builder --win",
+    "build:backend": "powershell -NoProfile -ExecutionPolicy Bypass -File ../scripts/build-backend.ps1",
+    "build:unpack": "npm run build:backend && npm run build && electron-builder --config electron-builder.windows.yml --dir --win --x64 --publish never",
+    "build:win": "npm run build:unpack && powershell -NoProfile -ExecutionPolicy Bypass -File ../scripts/build-nsis-installer.ps1",
     "build:mac": "electron-vite build && electron-builder --mac",
     "build:linux": "electron-vite build && electron-builder --linux"
   },

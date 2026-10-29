@@ -1,34 +1,24 @@
-# desktop-app
+# Jo Workspace desktop
 
-An Electron application with React and TypeScript
+Klien React/Electron untuk backend FastAPI Jo Workspace. Secara default Electron
+menghubungi `http://127.0.0.1:8010`; mode development memakai proxy Vite ke URL
+yang sama.
 
-## Recommended IDE Setup
-
-- [VSCode](https://code.visualstudio.com/) + [ESLint](https://marketplace.visualstudio.com/items?itemName=dbaeumer.vscode-eslint) + [Prettier](https://marketplace.visualstudio.com/items?itemName=esbenp.prettier-vscode)
-
-## Project Setup
-
-### Install
-
-```bash
-$ npm install
+```powershell
+npm install
+npm run dev
 ```
 
-### Development
+Jalankan backend dari root project lebih dahulu. Masukkan token API ketika dialog
+koneksi muncul. Untuk validasi sebelum packaging:
 
-```bash
-$ npm run dev
+```powershell
+npm run typecheck
+npm run lint
+npm test
+npm run build
 ```
 
-### Build
-
-```bash
-# For windows
-$ npm run build:win
-
-# For macOS
-$ npm run build:mac
-
-# For Linux
-$ npm run build:linux
-```
+Build produksi: `npm run build:win`, `npm run build:mac`, atau
+`npm run build:linux`. Renderer berjalan dengan context isolation dan sandbox;
+Node integration tidak tersedia di halaman web.

@@ -1,0 +1,15 @@
+name: jo-workspace-searxng
+services:
+  search:
+    image: docker.io/searxng/searxng:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./runtime/settings.yml:/etc/searxng/settings.yml:ro
+      - searx-cache:/var/cache/searxng
+    read_only: true
+    tmpfs:
+      - /tmp
+volumes:
+  searx-cache:

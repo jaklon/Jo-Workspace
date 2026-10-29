@@ -1,80 +1,66 @@
-import os
+"""Explicit modality routing and retrieval over the entire attachment."""
 import re
-from ollama import Client
+from pathlib import Path
+from config import DOCUMENT_EXTENSIONS, IMAGE_EXTENSIONS, CONTEXT_TOKENS, OUTPUT_TOKENS
+import config
+from model_runtime import clean_answer, token_upper_bound
 
-REASONING_MODEL = "qwen-9b-reasoning"
+clean_reasoning_output = clean_answer
 
-ollama_client = Client(host="http://127.0.0.1:11434")
 
-def detect_pipeline_route(filename: str | None, prompt: str) -> str:
-    """Mendeteksi alur pipeline berdasarkan ekstensi file dan intent prompt."""
+def detect_pipeline_route(filename, prompt):
     if filename:
-        ext = os.path.splitext(filename)[1].lower()
-        if ext in [".png", ".jpg", ".jpeg", ".webp"]:
+        ext = Path(filename).suffix.lower()
+        if ext in IMAGE_EXTENSIONS:
             return "VISION_PIPELINE"
-        if ext in [".pdf", ".docx", ".xlsx", ".txt", ".csv"]:
+        if ext in DOCUMENT_EXTENSIONS:
             return "DOCUMENT_PIPELINE"
-
-    lower_prompt = prompt.lower()
-    if any(
-        k in lower_prompt
-        for k in [
-            "nmap", "sqlmap", "cve", "pentest", "vulnerability", "audit",
-            "exploit", "payload",
-        ]
-    ):
+        raise ValueError("Format lampiran tidak didukung.")
+    if re.search(r"\b(nmap|sqlmap|cve|pentest|vulnerability|audit|exploit|payload)\b", prompt, re.I):
         return "CYBERSECURITY_PIPELINE"
-    if any(k in lower_prompt for k in ["function", "class", "debug", "error", "traceback", "code"]):
+    if re.search(r"\b(function|class|debug|error|traceback|code|kode|refactor)\b", prompt, re.I):
         return "CODING_PIPELINE"
-
     return "GENERAL_REASONING"
 
 
-def clean_reasoning_output(raw_content: str) -> str:
-    """Menghapus reasoning internal dari jawaban yang ditampilkan ke pengguna."""
-    cleaned = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL)
-    # Beberapa template model menyembunyikan tag pembuka, tetapi tetap mengirim
-    # penutupnya. Dalam kasus itu, teks sebelum penutup adalah reasoning internal.
-    if "</think>" in cleaned:
-        cleaned = cleaned.split("</think>", maxsplit=1)[-1]
-    return cleaned.strip()
+def chunks_for(attachment):
+    chunks = []
+    for number, line in enumerate(attachment["content"].splitlines(), 1):
+        remaining = line.strip()
+        while remaining:
+            end = min(len(remaining), 500)
+            while len(remaining[:end].encode("utf-8")) > 700:
+                end = max(1, end // 2)
+            piece, remaining = remaining[:end], remaining[end:]
+            if chunks and chunks[-1]["line_end"] >= number - 1 and len((chunks[-1]["text"]+piece).encode("utf-8")) < 700:
+                chunks[-1]["text"] += "\n" + piece
+                chunks[-1]["line_end"] = number
+            else:
+                chunks.append({"attachment_id": attachment["id"], "filename": attachment["name"],
+                               "line_start": number, "line_end": number, "text": piece})
+    for i, chunk in enumerate(chunks, 1):
+        chunk["section"] = i
+    return chunks
 
 
-def analyze_document_with_r1(document_text: str, user_prompt: str) -> str:
-    """Menganalisis dokumen atau pertanyaan umum dengan Qwen 9B."""
-    # Potong jika teks terlalu panjang melebihi context window
-    truncated_text = document_text[:12000]
-
-    system_instruction = (
-        "Kamu adalah AI Lead Architect & Technical/Document Auditor. "
-        "Analisis pertanyaan atau dokumen berikut secara mendalam, objektif, "
-        "dan berikan jawaban yang terstruktur rapi dalam bahasa Indonesia."
-    )
-
-    if truncated_text.strip():
-        combined_input = (
-            f"KONTEN DOKUMEN:\n\"\"\"\n{truncated_text}\n\"\"\"\n\n"
-            f"PERMINTAAN USER: {user_prompt}"
-        )
-    else:
-        combined_input = user_prompt
-
-    response = ollama_client.chat(
-        model=REASONING_MODEL,
-        messages=[
-            {"role": "system", "content": system_instruction},
-            {"role": "user", "content": combined_input}
-        ],
-        # Progres tingkat tinggi sudah dikirim oleh endpoint SSE. Menonaktifkan
-        # thinking internal mencegah model menghabiskan waktu lama pada reasoning
-        # tersembunyi yang pada akhirnya dibuang oleh clean_reasoning_output().
-        think=False,
-        options={
-            "temperature": 0.3,
-            "num_ctx": 4096,
-            "num_predict": 1200,
-        },
-    )
-
-    raw_content = response["message"]["content"]
-    return clean_reasoning_output(raw_content)
+def retrieve(attachments, prompt, system):
+    candidates = [c for a in attachments for c in chunks_for(a)]
+    terms = set(re.findall(r"\w+", prompt.lower())) - {"yang", "dan", "apa", "pada", "ini", "itu", "dari", "di", "dokumen", "file", "saya", "tolong", "berikan", "saja"}
+    def score(chunk):
+        return len(terms & set(re.findall(r"\w+", chunk["text"].lower())))
+    ranked = sorted(enumerate(candidates), key=lambda item: (-score(item[1]), item[0]))
+    available = config.CONTEXT_TOKENS - config.OUTPUT_TOKENS - token_upper_bound(system + prompt) - 450
+    selected = []
+    for _, chunk in ranked:
+        label = f"[{chunk['filename']} bagian {chunk['section']}, baris {chunk['line_start']}-{chunk['line_end']}]"
+        cost = token_upper_bound(label + "\n" + chunk["text"]) + 20
+        if cost <= available:
+            selected.append({**chunk, "label": label})
+            available -= cost
+    if candidates and not selected:
+        raise ValueError("Tidak cukup ruang konteks untuk sumber. Persingkat pertanyaan.")
+    coverage = {"selected": len(selected), "total": len(candidates), "complete": len(selected) == len(candidates)}
+    notice = ("Seluruh bagian tersedia." if coverage["complete"] else
+              f"Cakupan terbatas: {len(selected)} dari {len(candidates)} bagian dipilih berdasarkan pertanyaan. Ini bukan pemeriksaan seluruh dokumen.")
+    context = notice + "\n\n" + "\n\n".join(c["label"]+"\n"+c["text"] for c in selected)
+    return context, selected, coverage

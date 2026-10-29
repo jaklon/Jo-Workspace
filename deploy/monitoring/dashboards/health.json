@@ -1,0 +1,1 @@
+{"uid":"jo-health","title":"Jo Workspace · Monitoring Services","schemaVersion":39,"version":1,"refresh":"15s","panels":[{"id":1,"title":"Service scrape health (1 = up)","type":"stat","datasource":{"type":"prometheus","uid":"jo-prometheus"},"targets":[{"expr":"up","legendFormat":"{{job}}"}],"gridPos":{"h":8,"w":24,"x":0,"y":0}}],"time":{"from":"now-1h","to":"now"}}

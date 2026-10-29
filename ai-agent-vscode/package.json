@@ -1,7 +1,7 @@
 {
   "name": "ai-agent-vscode",
-  "displayName": "ai-agent-vscode",
-  "description": "",
+  "displayName": "Jo Workspace",
+  "description": "Review pilihan kode dengan model lokal Jo Workspace.",
   "version": "0.0.1",
   "engines": {
     "vscode": "^1.136.0"
@@ -10,14 +10,26 @@
     "Other"
   ],
   "activationEvents": [
-    "onCommand:ai-agent.refactorCode"
+    "onCommand:ai-agent.refactorCode",
+    "onCommand:ai-agent.configureConnection"
   ],
   "main": "./dist/extension.js",
   "contributes": {
+    "configuration": {
+      "title": "Jo Workspace",
+      "properties": {
+        "ai-agent.apiBaseUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8010",
+          "description": "URL backend lokal atau HTTPS privat. Token disimpan di VS Code SecretStorage."
+        }
+      }
+    },
     "commands": [
+      { "command": "ai-agent.configureConnection", "title": "Jo Workspace: Set API Token" },
       {
         "command": "ai-agent.refactorCode",
-        "title": "AI Agent: Refactor Code"
+        "title": "Jo Workspace: Review Selection"
       }
     ]
   },

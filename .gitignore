@@ -66,14 +66,39 @@ release/
 *.bin
 
 # Runtime-generated reports and uploads
+data/runtime/
+data/qa-runtime/
+output/ui-qa/
+output/windows-build/
+output/security-stage1/
+workspace/
 data/reports/*
 data/uploads/*
 !data/reports/.gitkeep
 !data/uploads/.gitkeep
 
 # Logs and temporary files
+.video_deps/
+output/
 *.log
 *.tmp
 *.temp
 tmp/
 temp/
+
+output/security-stage2/
+
+output/local-desktop/
+
+output/security-stage3/
+
+output/security-stage4/
+
+output/security-stage5/
+
+output/security-stage6/
+
+output/security-stage7/
+deploy/searxng/runtime/
+deploy/monitoring/runtime/
+output/amass-source/

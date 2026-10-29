@@ -1,109 +1,113 @@
-import json
-import subprocess
+"""Model tools cannot mutate files; writes require human-reviewed proposals."""
+import difflib
+import hashlib
 import os
-from typing import Any, Callable, Dict
+import subprocess
+import tempfile
+from pathlib import Path
+from config import WORKSPACE_DIR, MAX_FILE_TEXT
 
-WORKSPACE_ROOT = os.path.abspath("./workspace")
-
-
-def safe_path(rel_path: str) -> str:
-    dest = os.path.abspath(os.path.join(WORKSPACE_ROOT, rel_path))
-    if not dest.startswith(WORKSPACE_ROOT):
-        raise PermissionError("Akses path di luar workspace ditolak.")
-    return dest
+WORKSPACE_ROOT = str(WORKSPACE_DIR)
+FORBIDDEN = {".git", ".env", ".ssh", "node_modules", "venv", ".venv", "__pycache__", ".agent-backups"}
 
 
-def read_file(path: str) -> str:
-    full_path = safe_path(path)
-    if not os.path.exists(full_path):
-        return f"Error: File '{path}' tidak ditemukan."
-    with open(full_path, "r", encoding="utf-8") as f:
-        return f.read()
+def safe_path(rel_path):
+    if not isinstance(rel_path, str) or not rel_path or "\x00" in rel_path:
+        raise PermissionError("Path tidak valid.")
+    relative = Path(rel_path)
+    if any(part not in {".", ".."} and part.rstrip(" .") != part for part in relative.parts):
+        raise PermissionError("Path dengan titik/spasi di akhir tidak diizinkan.")
+    if relative.is_absolute() or relative.drive or ":" in rel_path or any(p.lower() in FORBIDDEN or p.lower().startswith(".env.") for p in relative.parts):
+        raise PermissionError("Gunakan path relatif non-rahasia di workspace.")
+    root = Path(WORKSPACE_ROOT).resolve()
+    destination = (root / relative).resolve()
+    if not destination.is_relative_to(root):
+        raise PermissionError("Akses di luar workspace ditolak.")
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise PermissionError("Symlink tidak diizinkan.")
+        if os.name == "nt" and current.exists():
+            import stat
+            if getattr(current.lstat(), "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+                raise PermissionError("Windows reparse point tidak diizinkan.")
+    return str(destination)
 
 
-def write_file(path: str, content: str) -> str:
-    full_path = safe_path(path)
-    os.makedirs(os.path.dirname(full_path), exist_ok=True)
-    with open(full_path, "w", encoding="utf-8") as f:
-        f.write(content)
-    return f"Sukses menulis file: {path}"
+def read_file(path):
+    target = Path(safe_path(path))
+    if target.stat().st_size > MAX_FILE_TEXT:
+        raise ValueError("File terlalu besar; pilih file lebih kecil.")
+    return {"ok": True, "path": path, "content": target.read_text(encoding="utf-8")}
 
-def list_dir(path: str = ".") -> str:
-    """Melihat daftar file dan folder di path tertentu."""
-    full_path = safe_path(path)
-    if not os.path.exists(full_path):
-        return f"Error: Path '{path}' tidak ditemukan."
+
+def list_dir(path="."):
+    entries = sorted(p.name for p in Path(safe_path(path)).iterdir() if p.name.lower() not in FORBIDDEN and not p.name.lower().startswith(".env."))
+    return {"ok": True, "entries": entries[:200], "truncated": len(entries) > 200}
+
+
+def proposal_payload(path, content):
+    if len(content.encode("utf-8")) > MAX_FILE_TEXT:
+        raise ValueError("Usulan file terlalu besar.")
+    target = Path(safe_path(path))
+    if target.exists() and target.stat().st_size > MAX_FILE_TEXT:
+        raise ValueError("File tujuan terlalu besar.")
+    old = target.read_bytes() if target.exists() else None
+    old_text = old.decode("utf-8") if old is not None else ""
+    diff = "".join(difflib.unified_diff(old_text.splitlines(True), content.splitlines(True), fromfile=path+" (sebelum)", tofile=path+" (usulan)"))
+    if not diff:
+        raise ValueError("Tidak ada perubahan untuk diusulkan.")
+    return {"path": path, "content": content, "before_hash": hashlib.sha256(old).hexdigest() if old is not None else None, "diff": diff}
+
+
+def apply_proposal(payload):
+    target = Path(safe_path(payload["path"]))
+    old = target.read_bytes() if target.exists() else None
+    fingerprint = hashlib.sha256(old).hexdigest() if old is not None else None
+    if fingerprint != payload["before_hash"]:
+        raise ValueError("File berubah sejak proposal dibuat. Buat proposal baru agar perubahan terbaru tidak tertimpa.")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    safe_path(payload["path"])
+    if old is not None:
+        backup_root = Path(WORKSPACE_ROOT) / ".agent-backups"
+        backup_root.mkdir(exist_ok=True)
+        if backup_root.is_symlink() or backup_root.resolve() != backup_root.absolute():
+            raise PermissionError("Direktori backup tidak aman.")
+        backup = backup_root / (hashlib.sha256(payload["path"].encode()).hexdigest()+"-"+fingerprint+".bak")
+        if not backup.exists():
+            backup.write_bytes(old)
+    descriptor, temporary = tempfile.mkstemp(prefix=".agent-", dir=target.parent)
     try:
-        entries = os.listdir(full_path)
-        return "\n".join(entries) if entries else "(Direktori kosong)"
-    except Exception as e:
-        return f"Error listing directory: {str(e)}"
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+            handle.write(payload["content"])
+        safe_path(payload["path"])
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return {"ok": True, "path": payload["path"]}
 
 
-def run_command(command: str) -> str:
-    """Menjalankan terminal command secara aman di dalam workspace."""
-    # Whitelist command sederhana untuk keamanan
-    allowed_prefixes = ["npm test", "pytest", "python -m unittest", "git status"]
-    if not any(command.strip().startswith(prefix) for prefix in allowed_prefixes):
-        return f"Error: Command '{command}' tidak diizinkan. Hanya test/linting commands yang diperbolehkan."
-
-    try:
-        result = subprocess.run(
-            command,
-            cwd=WORKSPACE_ROOT,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        output = result.stdout if result.stdout else result.stderr
-        return output.strip() if output else "Command berhasil dijalankan tanpa output."
-    except subprocess.TimeoutExpired:
-        return "Error: Eksekusi command melebihi batas waktu (30 detik)."
-    except Exception as e:
-        return f"Error: {str(e)}"
+def write_file(path, content):
+    raise PermissionError("Penulisan langsung dinonaktifkan. Gunakan proposal dan persetujuan pengguna.")
 
 
-# Skema OpenAPI untuk Model
+def run_command(command):
+    # Test runners execute workspace code; never expose shell strings to models.
+    if command != "git status":
+        raise PermissionError("Perintah tidak diizinkan.")
+    result = subprocess.run(["git", "--no-optional-locks", "status", "--short"], cwd=WORKSPACE_ROOT, shell=False, capture_output=True, text=True, timeout=10)
+    return {"ok": result.returncode == 0, "exit_code": result.returncode, "stdout": result.stdout[:8000], "stderr": result.stderr[:2000]}
+
+
+def definition(name, description, properties, required):
+    return {"type": "function", "function": {"name": name, "description": description, "parameters": {"type": "object", "properties": properties, "required": required, "additionalProperties": False}}}
+
+
 TOOL_DEFINITIONS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "Membaca konten file dari workspace relatif.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path relatif file dari root workspace",
-                    }
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_file",
-            "description": "Menulis atau menimpa isi file di workspace.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Path relatif file"},
-                    "content": {
-                        "type": "string",
-                        "description": "Konten teks lengkap yang akan ditulis",
-                    },
-                },
-                "required": ["path", "content"],
-            },
-        },
-    },
+    definition("read_file", "Baca file relatif di workspace.", {"path": {"type": "string"}}, ["path"]),
+    definition("list_dir", "Daftar file di workspace.", {"path": {"type": "string"}}, ["path"]),
+    definition("propose_write", "Usulkan perubahan untuk persetujuan pengguna; belum menulis.", {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
 ]
-
-TOOL_RUNNERS: Dict[str, Callable[..., Any]] = {
-    "read_file": read_file,
-    "write_file": write_file,
-}
+TOOL_RUNNERS = {"read_file": read_file, "list_dir": list_dir}

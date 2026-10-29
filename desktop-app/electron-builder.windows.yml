@@ -1,0 +1,40 @@
+appId: id.agentos.desktop
+productName: Jo Workspace
+copyright: Copyright © 2026 Jo Workspace
+directories:
+  buildResources: build
+  output: dist
+files:
+  - out/**
+  - package.json
+extraResources:
+  - from: build/backend/agent-backend
+    to: backend
+    filter:
+      - '**/*'
+  - from: out/renderer
+    to: web
+asar: true
+npmRebuild: false
+electronDist: node_modules/electron/dist
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  executableName: Jo Workspace
+  icon: build/agent-os.ico
+  requestedExecutionLevel: asInvoker
+nsis:
+  include: installer.nsh
+  artifactName: Jo-Workspace-${version}-Windows-x64-Setup.${ext}
+  oneClick: false
+  perMachine: false
+  allowElevation: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: always
+  createStartMenuShortcut: true
+  shortcutName: Jo Workspace
+  uninstallDisplayName: Jo Workspace
+  deleteAppDataOnUninstall: false
+  runAfterFinish: true
+  installerLanguages: [en_US]

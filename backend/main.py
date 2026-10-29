@@ -1,451 +1,400 @@
-import base64
 import asyncio
+import hmac
 import json
-from pathlib import Path
-from typing import Literal
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-from sse_starlette.sse import EventSourceResponse
+import logging
+from contextlib import asynccontextmanager, aclosing
 import httpx
-import pynvml  # Sekarang sudah menggunakan wrapper resmi nvidia-ml-py
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
+from sse_starlette.sse import EventSourceResponse
+from config import ROOT, WORKSPACE_DIR, MODELS, OLLAMA_URL, ALLOWED_ORIGINS, MODEL_TIMEOUT, WEB_DIST_DIR
+from contracts import ChatPayload, AgentPayload, HistoryMessage, event
+from model_runtime import runtime, clean_answer
+from security import ApiBoundary, load_token, session_cookie
+from store import Store
+from services import read_upload, ingest_document, ingest_image, prepare_chat, answer_chat, until_disconnect
 from agent import execute_agent_pipeline
-from doc_engine import parse_document_file
-from router import clean_reasoning_output, detect_pipeline_route, analyze_document_with_r1
+from router import detect_pipeline_route
+from tools import apply_proposal
+from pentest import Assessment, assess, targets, nmap_path
+import preferences
+from config import DATA_DIR
+from engagements import EngagementStore, router as engagement_router
+from local_desktop import router as local_desktop_router
+from security_jobs import JobStore, OfflineJobRunner, router as jobs_router
+from security_evidence import EvidenceStore, router as evidence_router
+from mcp_gateway import MCPGateway, router as mcp_router
+from security_orchestration import OrchestrationStore, OrchestrationWorker, router as orchestration_router
+from security_agents import SpecialistStore, SpecialistWorker, router as specialists_router
+from web_checks import WebRunner
+from bounded_scan import ScanRunner, ApprovedScanExecution, binary_hash
+from search_workspace import router as search_router
+from chat_web import web_context, linked_answer
+from deep_analysis import router as deep_analysis_router, init as init_deep_analysis, chat_report
 
-app = FastAPI(title="Local Multi-Model Agent Engine")
-
-WEB_DIST_DIR = Path(__file__).resolve().parent.parent / "desktop-app" / "out" / "renderer"
-
-# CORS middleware agar Desktop Electron dan VS Code bisa akses bebas
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-OLLAMA_BASE_URL = "http://127.0.0.1:11434"
-
-CHAT_SYSTEM_INSTRUCTION = (
-    "Jawab pengguna secara langsung, ramah, dan ringkas dalam bahasa Indonesia. "
-    "Untuk pertanyaan sederhana, jangan tampilkan proses berpikir atau langkah internal. "
-    "Jika penalaran memang diperlukan, tulis hanya ringkasan singkat (maksimal 4 poin) "
-    "di dalam tag <think>...</think>, lalu berikan jawaban akhir setelah tag tersebut. "
-    "Jangan gunakan judul 'Thinking Process' dan jangan tampilkan draf, opsi jawaban, "
-    "atau self-correction kepada pengguna."
-)
-
-VISION_EXTRACTION_SYSTEM_INSTRUCTION = (
-    "Kamu adalah mesin ekstraksi visual. Analisis gambar secara objektif dalam bahasa Indonesia. "
-    "Ekstrak teks yang terlihat (OCR), elemen UI, struktur/layout, tabel, diagram, label, "
-    "angka, dan relasi penting. Jangan membuat asumsi di luar gambar. "
-    "Jangan menjawab pertanyaan pengguna secara langsung; hasilmu akan diteruskan ke AI lain."
-)
-
-VISION_REASONING_SYSTEM_INSTRUCTION = (
-    "Kamu adalah AI Lead Architect & Visual Analyst. Jawab pertanyaan pengguna berdasarkan "
-    "bukti visual yang diekstrak dari gambar. Jelaskan secara akurat, terstruktur, dan dalam "
-    "bahasa Indonesia. Jika bukti visual tidak cukup, nyatakan keterbatasannya; jangan mengarang. "
-    "Berikan jawaban akhir langsung tanpa menampilkan proses berpikir, draf, atau tag <think>."
-)
-
-# Pemetaan target modul ke nama model yang terdaftar di Ollama
-MODEL_MAPPING = {
-    "reasoning": "qwen-9b-reasoning",
-    "coding": "qwen-9b-reasoning",
-    "security": "qwen3.8-heretic-q4",
-    "vision": "minicpm-v:latest",
-}
+logger = logging.getLogger("agent.api")
 
 
-class ChatHistoryMessage(BaseModel):
-    role: Literal["user", "assistant"]
-    content: str
-
-
-class ChatPayload(BaseModel):
-    prompt: str
-    target: Literal["reasoning", "coding", "security"] = "reasoning"
-    history: list[ChatHistoryMessage] = []
-
-
-def format_chat_history(history: list[ChatHistoryMessage]) -> str:
-    """Membuat konteks ringkas dari sesi yang dikirim renderer."""
-    if not history:
-        return ""
-    transcript = "\n".join(
-        f"{'Pengguna' if message.role == 'user' else 'Asisten'}: {message.content}"
-        for message in history[-12:]
-        if message.content.strip()
-    )
-    return f"Konteks percakapan sebelumnya:\n{transcript}\n\n" if transcript else ""
-
-
-def parse_form_history(history: str) -> list[ChatHistoryMessage]:
+@asynccontextmanager
+async def lifespan(app):
+    load_token()
+    preferences.load_settings()
+    WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+    app.state.store = Store()
+    app.state.write_lock = asyncio.Lock()
+    app.state.pentest_lock = asyncio.Lock()
+    app.state.engagements = EngagementStore(DATA_DIR)
+    app.state.jobs = JobStore(app.state.engagements)
+    app.state.evidence = EvidenceStore(app.state.engagements, app.state.jobs)
+    app.state.web_runner = WebRunner(app.state.jobs, app.state.evidence)
+    init_deep_analysis(app.state.engagements)
+    app.state.jobs.web_runner = app.state.web_runner
+    app.state.scan_runner = ScanRunner(app.state.jobs, app.state.evidence)
+    app.state.jobs.scan_runner = app.state.scan_runner
+    app.state.mcp = MCPGateway(app.state.engagements, app.state.jobs, app.state.evidence, DATA_DIR)
+    app.state.jobs.gateway = app.state.mcp
+    app.state.job_runner = OfflineJobRunner(app.state.jobs)
+    app.state.job_runner.start()
+    app.state.orchestrations = OrchestrationStore(app.state.engagements, app.state.jobs, app.state.mcp, app.state.evidence)
+    app.state.jobs.orchestrations = app.state.orchestrations
+    app.state.orchestration_worker = OrchestrationWorker(app.state.orchestrations)
+    app.state.orchestration_worker.start()
+    app.state.specialists = SpecialistStore(app.state.engagements, app.state.jobs, app.state.evidence)
+    app.state.jobs.specialists = app.state.specialists
+    app.state.specialist_worker = SpecialistWorker(app.state.specialists)
+    app.state.specialist_worker.start()
     try:
-        return [ChatHistoryMessage(**message) for message in json.loads(history)]
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return []
+        yield
+    finally:
+        await app.state.specialist_worker.stop()
+        await app.state.orchestration_worker.stop()
+        await app.state.job_runner.stop()
+
+
+app = FastAPI(title="Jo Workspace", lifespan=lifespan)
+app.include_router(engagement_router)
+app.include_router(local_desktop_router)
+app.include_router(jobs_router)
+app.include_router(evidence_router)
+app.include_router(mcp_router)
+app.include_router(orchestration_router)
+app.include_router(specialists_router)
+app.include_router(search_router)
+app.include_router(deep_analysis_router)
+app.add_middleware(ApiBoundary)
+app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS,
+                   allow_credentials=True, allow_methods=["GET", "POST", "PUT", "DELETE"],
+                   allow_headers=["Authorization", "Content-Type"])
+
+
+def error_text(exc):
+    if isinstance(exc, (TimeoutError, httpx.TimeoutException)):
+        return "Batas waktu inferensi/antrean tercapai. Coba permintaan yang lebih singkat."
+    if isinstance(exc, httpx.HTTPError):
+        return "Ollama tidak dapat dihubungi. Pastikan layanan model aktif."
+    return str(exc)[:500] or "Permintaan gagal."
+
+
+@app.exception_handler(ValueError)
+async def invalid_input(request, exc):
+    return JSONResponse({"detail": error_text(exc)}, status_code=400)
+
+
+@app.exception_handler(TimeoutError)
+@app.exception_handler(httpx.TimeoutException)
+async def timed_out(request, exc):
+    return JSONResponse({"detail": error_text(exc)}, status_code=504)
+
+
+@app.exception_handler(httpx.HTTPError)
+async def model_unavailable(request, exc):
+    return JSONResponse({"detail": error_text(exc)}, status_code=503)
+
+
+class Login(BaseModel):
+    token: str = Field(min_length=24, max_length=200)
+
+
+@app.post("/api/session")
+async def login(payload: Login, request: Request, response: Response):
+    if not hmac.compare_digest(payload.token, request.state.api_token):
+        raise HTTPException(401, "Token akses tidak benar.")
+    response.set_cookie("agent_session", session_cookie(request.state.api_token),
+                        httponly=True, secure=request.url.scheme == "https",
+                        samesite="strict", max_age=43200, path="/")
+    return {"status": "connected"}
+
+
+@app.delete("/api/session")
+async def logout(response: Response):
+    response.delete_cookie("agent_session", path="/")
+    return {"status": "disconnected"}
 
 
 @app.get("/api/health")
 async def health_check():
-    """Mengecek apakah Ollama engine aktif di latar belakang."""
+    async with httpx.AsyncClient(timeout=3) as client:
+        response = await client.get(OLLAMA_URL+"/api/tags")
+        response.raise_for_status()
+        models = [m["name"] for m in response.json().get("models", [])]
+    missing = [name for name in set(MODELS.values()) if name not in models and name+":latest" not in models]
+    return {"status": "connected" if not missing else "degraded", "installed_models": models,
+            "missing_models": missing, "models": MODELS,
+            "queue": {"active": runtime.active, "waiting": runtime.waiting}}
+
+
+def gpu_status():
     try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            resp = await client.get(f"{OLLAMA_BASE_URL}/api/tags")
-            if resp.status_code == 200:
-                models = [m.get("name") for m in resp.json().get("models", [])]
-                return {"status": "connected", "loaded_models": models}
+        import pynvml
+        pynvml.nvmlInit()
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            name = pynvml.nvmlDeviceGetName(handle)
+            return {"available": True, "name": name.decode() if isinstance(name, bytes) else name,
+                    "vram_used_mb": info.used // 1024**2, "vram_total_mb": info.total // 1024**2,
+                    "usage_percent": round(info.used / info.total * 100)}
+        finally:
+            pynvml.nvmlShutdown()
     except Exception:
-        pass
-    raise HTTPException(
-        status_code=503,
-        detail="Ollama engine tidak terdeteksi. Pastikan aplikasi Ollama berjalan di latar belakang."
-    )
+        return {"available": False, "name": "GPU tidak tersedia", "vram_used_mb": 0,
+                "vram_total_mb": 0, "usage_percent": 0}
+
 
 @app.get("/api/gpu-status")
 async def get_gpu_status():
+    return await asyncio.to_thread(gpu_status)
+
+
+@app.get("/api/metrics")
+async def metrics():
+    return {"active": runtime.active, "waiting": runtime.waiting,
+            "completed": runtime.completed, "failed": runtime.failed, "last": runtime.last_metrics}
+
+
+@app.get("/api/settings")
+async def get_settings():
+    return {"settings": preferences.current.model_dump(), "defaults": preferences.defaults,
+            "ollama_url": OLLAMA_URL, "workspace": str(WORKSPACE_DIR),
+            "max_upload_mb": 8, "max_attachments": 4}
+
+
+@app.post("/api/settings")
+async def update_settings(payload: preferences.ServerSettings):
+    if runtime.active or runtime.waiting:
+        raise HTTPException(409, "Tunggu antrean model selesai sebelum mengubah pengaturan.")
+    preferences.save_settings(payload)
+    return {"settings": preferences.current.model_dump()}
+
+
+@app.get("/api/usage")
+async def get_usage():
+    return {"rows": runtime.usage.rows, "timezone": "UTC", "retention_days": 90,
+            "persistence_error": runtime.usage.persistence_error,
+            "active": runtime.active, "waiting": runtime.waiting}
+
+
+@app.delete("/api/usage")
+async def clear_usage():
+    if runtime.active or runtime.waiting:
+        raise HTTPException(409, "Tunggu antrean model selesai sebelum menghapus usage.")
     try:
-        pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-        info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        used_mb = int(info.used / (1024 ** 2))
-        total_mb = int(info.total / (1024 ** 2))
-        pynvml.nvmlShutdown()
-        return {
-            "name": "NVIDIA RTX 3060",
-            "vram_used_mb": used_mb,
-            "vram_total_mb": total_mb,
-            "usage_percent": int((used_mb / total_mb) * 100)
-        }
-    except Exception:
-        return {
-            "name": "NVIDIA RTX 3060",
-            "vram_used_mb": 0,
-            "vram_total_mb": 6144,
-            "usage_percent": 0
-        }    
+        runtime.usage.clear()
+    except OSError as exc:
+        raise HTTPException(500, str(exc)) from exc
+    return {"status": "cleared"}
+
+
+def parse_history(value):
+    try:
+        parsed = TypeAdapter(list[HistoryMessage]).validate_json(value)
+        if len(parsed) > 12:
+            raise ValueError("Riwayat maksimal 12 pesan.")
+        return parsed
+    except ValidationError as exc:
+        raise ValueError("Format riwayat tidak valid.") from exc
+
+
+def wire(payload):
+    return {"data": json.dumps(payload, ensure_ascii=False)}
 
 
 @app.post("/api/chat")
-async def chat_endpoint(payload: ChatPayload):
-    selected_model = MODEL_MAPPING.get(payload.target, MODEL_MAPPING["reasoning"])
-    prompt_with_context = f"{format_chat_history(payload.history)}Pertanyaan terbaru pengguna: {payload.prompt}"
-
-    async def stream_generator():
+async def chat_endpoint(payload: ChatPayload, request: Request):
+    model = MODELS["reasoning" if payload.target == "vision" else payload.target]
+    prepared = (await prepare_chat(request.app.state.store, payload)
+                if payload.attachment_ids or payload.target == "vision" else None)
+    async def stream():
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                async with client.stream(
-                    "POST",
-                    f"{OLLAMA_BASE_URL}/api/generate",
-                    json={
-                        "model": selected_model,
-                        "system": CHAT_SYSTEM_INSTRUCTION,
-                        "prompt": prompt_with_context,
-                        "stream": True,
-                        "options": {
-                            "num_ctx": 4096,
-                            "temperature": 0.6 if payload.target == "reasoning" else 0.2
-                        }
-                    }
-                ) as response:
-                    if response.status_code != 200:
-                        yield {"data": json.dumps({"token": f"Error: HTTP {response.status_code}"})}
-                        return
-
-                    async for line in response.aiter_lines():
-                        if not line:
-                            continue
-                        chunk = json.loads(line)
-                        token = chunk.get("response", "")
-                        if token:
-                            # Kirim dalam format JSON terstruktur
-                            yield {"data": json.dumps({"token": token})}
-                        if chunk.get("done", False):
-                            break
-        except Exception as err:
-            yield {"data": json.dumps({"token": f"\n[Error: {str(err)}]"})}
-
-    return EventSourceResponse(stream_generator())
-
-
-@app.post("/api/vision/analyze")
-async def vision_endpoint(
-    image: UploadFile = File(...),
-    prompt: str = Form("Jelaskan diagram/screenshot ini secara detail."),
-    history: str = Form("[]"),
-):
-    image_bytes = await image.read()
-    b64_image = base64.b64encode(image_bytes).decode("utf-8")
-    vision_model = MODEL_MAPPING["vision"]
-
-    print(f"\n[DEBUG VISION] Target model: {vision_model}")
-    print(f"[DEBUG VISION] Ukuran byte gambar: {len(image_bytes)}")
-
-    prompt_with_context = f"{format_chat_history(parse_form_history(history))}Pertanyaan terbaru pengguna: {prompt}"
-
-    try:
-        async with httpx.AsyncClient(timeout=None) as client:
-            vision_response = await client.post(
-                f"{OLLAMA_BASE_URL}/api/generate",
-                json={
-                    "model": vision_model,
-                    "system": VISION_EXTRACTION_SYSTEM_INSTRUCTION,
-                    "prompt": f"Gambar untuk dianalisis. Fokus ekstraksi visual untuk kebutuhan user: {prompt}",
-                    "images": [b64_image],
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.2,
-                        "num_ctx": 4096,
-                    },
-                },
-            )
-
-            if vision_response.status_code != 200:
-                print(f"[OLLAMA VISION ERROR STATUS]: {vision_response.status_code}")
-                print(f"[OLLAMA VISION ERROR BODY]: {vision_response.text}")
-                raise HTTPException(
-                    status_code=vision_response.status_code,
-                    detail=f"Ollama Vision Error: {vision_response.text}",
-                )
-
-            visual_context = vision_response.json().get("response", "").strip()
-            if not visual_context:
-                raise HTTPException(
-                    status_code=502,
-                    detail="Model vision tidak menghasilkan konteks visual.",
-                )
-
-            reasoning_response = await client.post(
-                f"{OLLAMA_BASE_URL}/api/generate",
-                json={
-                    "model": MODEL_MAPPING["reasoning"],
-                    "system": VISION_REASONING_SYSTEM_INSTRUCTION,
-                    "prompt": (
-                        f"{prompt_with_context}\n\n"
-                        f"BUKTI VISUAL DARI MODEL VISION:\n\"\"\"\n"
-                        f"{visual_context}\n\"\"\""
-                    ),
-                    "stream": False,
-                    "options": {"temperature": 0.3, "num_ctx": 4096},
-                },
-            )
-            if reasoning_response.status_code != 200:
-                print(f"[OLLAMA REASONING ERROR STATUS]: {reasoning_response.status_code}")
-                print(f"[OLLAMA REASONING ERROR BODY]: {reasoning_response.text}")
-                raise HTTPException(
-                    status_code=reasoning_response.status_code,
-                    detail=f"Ollama Reasoning Error: {reasoning_response.text}",
-                )
-
-            final_answer = clean_reasoning_output(
-                reasoning_response.json().get("response", "")
-            )
-            return {
-                "result": final_answer,
-                # Ditampilkan sebagai detail opsional di UI agar pengguna dapat
-                # memverifikasi bukti OCR/visual yang dipakai Qwen untuk menjawab.
-                "visual_analysis": visual_context,
-            }
-    except httpx.ConnectError:
-        raise HTTPException(
-            status_code=503,
-            detail="Tidak dapat tersambung ke Ollama. Pastikan Ollama aktif.",
-        )
-
-class AgentPayload(BaseModel):
-    prompt: str
-    max_iterations: int = 5
+            yield wire(event("status", step="queued", label="Menunggu giliran model"))
+            deep = chat_report(request.app.state, payload.project_id, payload.prompt) if payload.target == 'reasoning' and not payload.attachment_ids else None
+            if deep is not None:
+                yield wire(event('result', result=deep, sources=[], coverage=None, images=[]))
+                yield wire(event('done'))
+                return
+            web = None
+            if not payload.attachment_ids and payload.target != "vision" and payload.web_mode != "off":
+                yield wire(event("status", step="web_plan", label="Memeriksa kebutuhan sumber web"))
+                web = await web_context(payload.prompt, payload.web_mode, model, payload.history)
+            if web:
+                messages, sources, coverage = web['messages'], web['sources'], None
+                images = web['images']
+                yield wire(event("status", step="web_sources", label="Menyusun jawaban dari sumber web"))
+            else:
+                _, messages, sources, coverage = prepared or await prepare_chat(request.app.state.store, payload)
+                images = []
+            if coverage:
+                yield wire(event("sources", sources=sources, coverage=coverage))
+            elif web:
+                yield wire(event("sources", sources=sources, images=images))
+            text = ""
+            async for chunk in runtime.chunks(model, messages):
+                if chunk.get("status") == "running":
+                    yield wire(event("status", step="running", label="Model sedang memproses"))
+                token = chunk.get("message", {}).get("content", "")
+                if token:
+                    text += token
+                    # Never expose partial model text: older/custom model templates can
+                    # place private reasoning in content before the final answer. The UI
+                    # still receives queue/running status and a cleaned terminal result.
+                if chunk.get("done_reason") == "length":
+                    raise ValueError("Batas token tercapai. Jawaban belum lengkap; persempit pertanyaan.")
+            answer = clean_answer(text)
+            if not answer or answer.lower().startswith("thinking process"):
+                raise ValueError("Model tidak menghasilkan jawaban akhir.")
+            if web:
+                answer = linked_answer(answer, sources)
+            yield wire(event("result", result=answer, sources=sources, coverage=coverage, images=images))
+            yield wire(event("done"))
+        except Exception as exc:
+            yield wire(event("error", detail=error_text(exc)))
+    return EventSourceResponse(stream(), ping=10)
 
 
-@app.post("/api/agent/run")
-async def run_agent_endpoint(payload: AgentPayload):
-    try:
-        # Menjalankan loop tool-calling dari agent.py
-        result = execute_agent_pipeline(
-            payload.prompt, max_iterations=payload.max_iterations
-        )
-        return {"status": "success", "result": result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def document_result(request, file, prompt, history, session_id):
+    name, data = await read_upload(file)
+    attachment = await ingest_document(request.app.state.store, session_id, name, data)
+    payload = ChatPayload(prompt=prompt, history=parse_history(history), session_id=session_id, attachment_ids=[attachment["id"]])
+    return {**await answer_chat(request.app.state.store, payload), "attachment": attachment, "filename": name}
+
+
 @app.post("/api/document/parse")
-async def parse_document_endpoint(
-    file: UploadFile = File(...), prompt: str = Form(...)
-):
-    try:
-        content_bytes = await file.read()
-        file_text = content_bytes.decode("utf-8", errors="ignore")
-
-        # Buat prompt yang menggabungkan isi file dengan instruksi user
-        combined_prompt = (
-            f"Konten file '{file.filename}':\n```\n{file_text}\n```\n\n"
-            f"Instruksi pengguna: {prompt}"
-        )
-
-        # Jalankan ke agent pipeline untuk dianalisis/dimodifikasi
-        result = execute_agent_pipeline(combined_prompt)
-        return {"status": "success", "result": result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+async def parse_document_endpoint(request: Request, file: UploadFile = File(...), prompt: str = Form(..., min_length=1, max_length=6000),
+                                  history: str = Form("[]", max_length=200000), session_id: str = Form("default", max_length=100)):
+    return await until_disconnect(request, document_result(request, file, prompt, history, session_id))
 
 
 @app.post("/api/document/analyze-stream")
-async def analyze_document_stream_endpoint(
-    file: UploadFile = File(...),
-    prompt: str = Form(...),
-    history: str = Form("[]"),
-):
-    """Stream tahapan kerja dokumen dan hasil akhirnya ke renderer."""
-    filename = file.filename or "dokumen"
-    file_bytes = await file.read()
-    prompt_with_context = (
-        f"{format_chat_history(parse_form_history(history))}"
-        f"Permintaan terbaru pengguna: {prompt}"
-    )
-
-    async def stream_generator():
+async def document_stream(request: Request, file: UploadFile = File(...), prompt: str = Form(..., min_length=1, max_length=6000),
+                          history: str = Form("[]", max_length=200000), session_id: str = Form("default", max_length=100)):
+    name, data = await read_upload(file)
+    parsed = parse_history(history)
+    async def stream():
         try:
-            yield {
-                "data": json.dumps(
-                    {
-                        "type": "status",
-                        "step": "received",
-                        "label": "Dokumen diterima",
-                        "detail": f"{filename} siap diproses.",
-                    }
-                )
-            }
-            yield {
-                "data": json.dumps(
-                    {
-                        "type": "status",
-                        "step": "extracting",
-                        "label": "Mengekstrak isi dokumen",
-                        "detail": "Membaca teks dan struktur yang dapat dikenali.",
-                    }
-                )
-            }
-            extracted_text = await asyncio.to_thread(
-                parse_document_file, filename, file_bytes
-            )
-            yield {
-                "data": json.dumps(
-                    {
-                        "type": "status",
-                        "step": "analyzing",
-                        "label": "AI sedang menganalisis",
-                        "detail": f"{len(extracted_text):,} karakter berhasil dibaca.",
-                    }
-                )
-            }
-            analysis_result = await asyncio.to_thread(
-                analyze_document_with_r1,
-                extracted_text,
-                prompt_with_context
-                or "Berikan ringkasan dan analisis lengkap dokumen ini.",
-            )
-            yield {
-                "data": json.dumps(
-                    {
-                        "type": "status",
-                        "step": "finalizing",
-                        "label": "Menyusun jawaban",
-                        "detail": "Merapikan hasil analisis untuk ditampilkan.",
-                    }
-                )
-            }
-            yield {
-                "data": json.dumps(
-                    {
-                        "type": "result",
-                        "result": analysis_result,
-                        "filename": filename,
-                    }
-                )
-            }
-        except Exception as err:
-            print(f"[DOCUMENT STREAM ERROR]: {str(err)}")
-            yield {
-                "data": json.dumps(
-                    {
-                        "type": "error",
-                        "detail": str(err),
-                    }
-                )
-            }
+            yield wire(event("status", step="extracting", label="Mengekstrak dokumen"))
+            attachment = await ingest_document(request.app.state.store, session_id, name, data)
+            yield wire(event("attachment", attachment=attachment))
+            yield wire(event("status", step="analyzing", label="Mencari sumber dan menganalisis"))
+            answer = await answer_chat(request.app.state.store, ChatPayload(prompt=prompt, history=parsed, session_id=session_id, attachment_ids=[attachment["id"]]))
+            yield wire(event("result", **answer, attachment=attachment))
+            yield wire(event("done"))
+        except Exception as exc:
+            yield wire(event("error", detail=error_text(exc)))
+    return EventSourceResponse(stream(), ping=10)
 
-    return EventSourceResponse(stream_generator())
+
+async def vision_result(request, image, prompt, history, session_id):
+    name, data = await read_upload(image)
+    attachment, evidence = await ingest_image(request.app.state.store, session_id, name, data)
+    answer = await answer_chat(request.app.state.store, ChatPayload(prompt=prompt, target="vision", history=parse_history(history),
+                                                                  session_id=session_id, attachment_ids=[attachment["id"]]))
+    return {**answer, "attachment": attachment, "visual_analysis": evidence}
+
+
+@app.post("/api/vision/analyze")
+async def vision_endpoint(request: Request, image: UploadFile = File(...), prompt: str = Form("Jelaskan gambar.", min_length=1, max_length=6000),
+                          history: str = Form("[]", max_length=200000), session_id: str = Form("default", max_length=100)):
+    return await until_disconnect(request, vision_result(request, image, prompt, history, session_id))
+
+
+@app.post("/api/agent/run")
+async def run_agent_endpoint(payload: AgentPayload, request: Request):
+    return await until_disconnect(request, execute_agent_pipeline(payload.prompt, payload.max_iterations,
+                                  store=request.app.state.store, session_id=payload.session_id))
+
+
+class Approval(BaseModel):
+    session_id: str = Field(min_length=1, max_length=100)
+    approve: bool
+
+
+@app.post("/api/agent/proposals/{proposal_id}")
+async def approve_proposal(proposal_id: str, payload: Approval, request: Request):
+    # Serialize approval + application to prevent replay/parallel overwrites.
+    async with request.app.state.write_lock:
+        store = request.app.state.store
+        proposal = await asyncio.to_thread(store.pending, proposal_id, payload.session_id)
+        if not payload.approve:
+            await asyncio.to_thread(store.finish, proposal_id, "rejected")
+            return {"status": "rejected"}
+        try:
+            result = await asyncio.to_thread(apply_proposal, proposal)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+        await asyncio.to_thread(store.finish, proposal_id, "applied")
+        return {"status": "applied", **result}
+
+
+@app.delete("/api/attachments/{attachment_id}")
+async def delete_attachment(attachment_id: str, request: Request, session_id: str):
+    await asyncio.to_thread(request.app.state.store.delete_attachment, attachment_id, session_id)
+    return {"status": "deleted"}
 
 
 @app.post("/api/agent/dispatch")
-async def dispatch_task_endpoint(
-    prompt: str = Form(...),
-    file: UploadFile | None = File(None),
-    history: str = Form("[]"),
-):
-    prompt_with_context = f"{format_chat_history(parse_form_history(history))}Permintaan terbaru pengguna: {prompt}"
-    filename = file.filename if file else None
-    route = detect_pipeline_route(filename, prompt)
-    print(f"[ROUTER] Terdeteksi rute: {route} untuk file: {filename}")
-
-    try:
-        if route == "DOCUMENT_PIPELINE" and file:
-            file_bytes = await file.read()
-            extracted_text = parse_document_file(filename, file_bytes)
-            analysis_result = analyze_document_with_r1(
-                document_text=extracted_text,
-                user_prompt=prompt_with_context or "Berikan ringkasan dan analisis lengkap dokumen ini.",
-            )
-            return {
-                "route": route,
-                "status": "success",
-                "filename": filename,
-                "result": analysis_result,
-            }
-
+async def dispatch_task_endpoint(request: Request, prompt: str = Form(..., min_length=1, max_length=6000),
+                                 file: UploadFile | None = File(None), history: str = Form("[]", max_length=200000),
+                                 session_id: str = Form("default", max_length=100)):
+    route = detect_pipeline_route(file.filename if file else None, prompt)
+    async def run():
+        if route == "VISION_PIPELINE":
+            return await vision_result(request, file, prompt, history, session_id)
+        if route == "DOCUMENT_PIPELINE":
+            return await document_result(request, file, prompt, history, session_id)
         if route == "CODING_PIPELINE":
-            result = execute_agent_pipeline(prompt_with_context)
-            return {"route": route, "status": "success", "result": result}
-
-        if route == "CYBERSECURITY_PIPELINE":
-            async with httpx.AsyncClient(timeout=None) as client:
-                resp = await client.post(
-                    f"{OLLAMA_BASE_URL}/api/generate",
-                    json={
-                        "model": MODEL_MAPPING["security"],
-                        "prompt": prompt_with_context,
-                        "stream": False,
-                        "options": {"temperature": 0.2, "num_ctx": 4096},
-                    },
-                )
-                if resp.status_code != 200:
-                    raise HTTPException(
-                        status_code=resp.status_code,
-                        detail=f"Ollama Error: {resp.text}",
-                    )
-                return {
-                    "route": route,
-                    "status": "success",
-                    "result": resp.json().get("response", "").strip(),
-                }
-
-        analysis_result = analyze_document_with_r1(
-            document_text="",
-            user_prompt=prompt_with_context,
-        )
-        return {"route": route, "status": "success", "result": analysis_result}
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[DISPATCH ERROR]: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+            return await execute_agent_pipeline(prompt, store=request.app.state.store, session_id=session_id)
+        return await answer_chat(request.app.state.store, ChatPayload(prompt=prompt, history=parse_history(history),
+            target="security" if route == "CYBERSECURITY_PIPELINE" else "reasoning", session_id=session_id))
+    return {"route": route, **await until_disconnect(request, run())}
 
 
-# Mount this last so every /api route keeps priority. The directory is created
-# by `npm run build` in desktop-app.
+@app.get("/api/pentest/capabilities")
+async def pentest_capabilities():
+    from nuclei_adapter import binary_hash as nuclei_hash
+    from zap_adapter import image_hash
+    from subfinder_adapter import fingerprint,amass_fingerprint
+    return {"targets": [], "nmap_available": bool(nmap_path()), "execution_enabled": False, "stage": 7,
+            "approved_tcp_scan_enabled":True,"nmap_binary_sha256":binary_hash(),
+            "tools":["tcp-connect","nmap","nuclei-head","zap-head","auth-unauthenticated-get","auth-two-session","inventory-html","js-bundle-inventory","scoped-spider","active-reflection","subfinder-passive","amass-passive","monitoring-local"],"nuclei_binary_sha256":nuclei_hash(),"zap_image_sha256":image_hash(),"subfinder_image_sha256":fingerprint(),"amass_image_sha256":amass_fingerprint(),"approval_required":True,
+            "execution_path":"Security Workspace > Engagement > Tools & monitoring"}
+
+
+@app.post("/api/pentest/run")
+async def pentest_run(payload: Assessment | ApprovedScanExecution, request: Request):
+    if isinstance(payload, Assessment):
+        raise HTTPException(423, 'Run memerlukan Project, Engagement dan job adapter yang ditinjau. Gunakan Tools & monitoring untuk menyiapkan rencana dan persetujuan.')
+    from security_jobs import Approval
+    project, engagement, jid = str(payload.project_id), str(payload.engagement_id), str(payload.job_id)
+    detail = request.app.state.jobs.detail(project, engagement, jid)
+    if not detail['plan'].get('scan'):
+        raise HTTPException(422, 'Endpoint ini hanya menerima job dengan adapter eksekusi yang didukung.')
+    return request.app.state.jobs.approve(project, engagement, jid, Approval(
+        expected_revision=payload.expected_revision, actor_label=payload.actor_label,
+        note=payload.note, acknowledge=payload.acknowledge))
+
+
 if WEB_DIST_DIR.is_dir():
     app.mount("/", StaticFiles(directory=WEB_DIST_DIR, html=True), name="web")

@@ -1,5 +1,6 @@
 param(
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [int]$Port = 8010
 )
 
 $ErrorActionPreference = "Stop"
@@ -17,6 +18,7 @@ if (-not $SkipBuild) {
     Push-Location $frontendDir
     try {
         npm run build
+        if ($LASTEXITCODE -ne 0) { throw "Build frontend gagal; server tidak dijalankan dengan aset lama." }
     }
     finally {
         Pop-Location
@@ -27,6 +29,7 @@ if (-not (Test-Path -LiteralPath $webIndex)) {
     throw "Frontend web belum dibangun. Jalankan script ini tanpa -SkipBuild."
 }
 
-Write-Host "Agent OS Web tersedia lokal di http://127.0.0.1:8010"
+Write-Host "Jo Workspace Web tersedia lokal di http://127.0.0.1:$Port"
+Write-Host "Token akses tersedia di data\runtime\api-token setelah backend mulai (atau AGENT_API_TOKEN)."
 Write-Host "Biarkan jendela ini tetap terbuka selama server digunakan."
-& $pythonExe -m uvicorn main:app --app-dir $backendDir --host 127.0.0.1 --port 8010
+& $pythonExe -m uvicorn main:app --app-dir $backendDir --host 127.0.0.1 --port $Port
