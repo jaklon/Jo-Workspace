@@ -2,7 +2,8 @@
 from typing import Literal
 import re
 import ipaddress
-from pydantic import BaseModel, ConfigDict, Field
+from urllib.parse import urlsplit
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 from model_runtime import bounded_messages, runtime
 
 
@@ -12,6 +13,42 @@ class Intent(BaseModel):
 
 
 ToolName = Literal["http-head", "tcp-connect", "nmap", "nuclei-head", "zap-head", "subfinder-passive", "amass-passive", "inventory-html", "js-bundle-inventory", "auth-unauthenticated-get", "auth-two-session", "scoped-spider", "active-reflection", "monitoring-local", "document-review", "unsupported"]
+VA_REQUEST = re.compile(r"\b(?:vulnerabilit(?:y|ies)\s+assessment|assessment\s+(?:kerentanan|keamanan)|"
+                        r"asesmen\s+(?:kerentanan|keamanan)|(?:analisis|pemeriksaan|uji|scan)\s+kerentanan|"
+                        r"(?:pemeriksaan|uji|scan)\s+keamanan|security\s+assessment|va|"
+                        r"(?:cek|periksa|check|tes|test|scan)\s+(?:celah\s+|kerentanan\s+)?(?:keamanan|kerentanan|security|vulnerabilit(?:y|ies))|"
+                        r"celah\s+(?:keamanan|kerentanan)|vulnerability\s+scan)\b", re.I)
+
+
+def without_urls(text):
+    return re.sub(r"https?://[^\s<>\"']+", " ", text, flags=re.I)
+
+
+def without_targets(text):
+    return re.sub(r"(?<![\w.-])(?:[a-z0-9-]+\.)+[a-z]{2,}(?![\w.-])", " ", without_urls(text), flags=re.I)
+
+
+def relevant_security_text(prompt, history):
+    """Keep a new VA request independent of earlier targets and tool choices."""
+    if VA_REQUEST.search(without_urls(prompt)):
+        reference = re.search(r'\b(?:tadi|sebelumnya|yang sama|target itu|target tersebut|url itu|url tersebut|situs itu|situs tersebut|same target|previous|again)\b', without_urls(prompt), re.I)
+        if reference and not re.search(r'https?://', prompt, re.I):
+            for index in range(len(history) - 1, -1, -1):
+                item = history[index]
+                if item.role == 'user' and VA_REQUEST.search(without_urls(item.content)) and re.search(r'https?://', item.content, re.I):
+                    return '\n'.join([*(message.content for message in history[index:] if message.role == 'user'), prompt])
+        return prompt
+    if history and history[-1].role == 'assistant' and history[-1].content.startswith('Permintaan memuat pengecualian.'):
+        return prompt
+    if history and history[-1].role == 'assistant' and (
+        history[-1].content.startswith('Untuk menyiapkan pemeriksaan, mohon sebutkan ')
+        or history[-1].content.startswith('Untuk http-head:')
+    ):
+        for index in range(len(history) - 1, -1, -1):
+            item = history[index]
+            if item.role == 'user' and VA_REQUEST.search(without_urls(item.content)):
+                return '\n'.join([*(message.content for message in history[index:] if message.role == 'user'), prompt])
+    return '\n'.join([*(item.content for item in history if item.role == 'user'), prompt])
 
 
 class ToolSelection(BaseModel):
@@ -23,6 +60,8 @@ class ToolSelection(BaseModel):
 
 class SecuritySlots(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    _url_va_profile: bool = PrivateAttr(default=False)
+    _va_constrained: bool = PrivateAttr(default=False)
     tool: ToolName = "unsupported"
     target: str = Field(default="", max_length=1000)
     ports: list[int] = Field(default_factory=list, max_length=16)
@@ -38,13 +77,17 @@ class SecuritySlots(BaseModel):
 
 def complete_explicit_slots(slots, user_text):
     """Fill unambiguous literal values only; never expand a URL into another scope."""
-    lower = user_text.casefold()
+    # A hostname such as "my-staging.example" is not a declaration of the
+    # environment. Only words outside URLs count as user-supplied slots.
+    outside_urls = without_urls(user_text)
+    lower = outside_urls.casefold()
+    context = without_targets(user_text).casefold()
     environments = {"lab": r"\blab(?:oratory)?\b", "development": r"\b(development|dev)\b",
                     "staging": r"\bstaging\b", "uat": r"\buat\b",
                     "production_readonly": r"\b(production|produksi)\b.*\b(read.only|hanya.baca)\b"}
     modes = {"blackbox": r"\bblack[ -]?box\b", "whitebox": r"\bwhite[ -]?box\b", "greybox": r"\bgr[ae]y[ -]?box\b"}
     for field, patterns in (("environment", environments), ("assessment_mode", modes)):
-        matches = [key for key, pattern in patterns.items() if re.search(pattern, lower, re.S)]
+        matches = [key for key, pattern in patterns.items() if re.search(pattern, context, re.S)]
         if len(matches) == 1:
             setattr(slots, field, matches[0])
     evidence_patterns = {"source_code": r"\b(source_code|kode sumber|source code)\b",
@@ -81,13 +124,16 @@ def complete_explicit_slots(slots, user_text):
     kinds = {"http-head": "url", "nuclei-head": "url", "zap-head": "url", "inventory-html": "url",
              "js-bundle-inventory": "url", "auth-unauthenticated-get": "url", "auth-two-session": "url", "scoped-spider": "url",
              "active-reflection": "url", "tcp-connect": "ip", "nmap": "ip", "monitoring-local": "ip",
-             "subfinder-passive": "domain", "amass-passive": "domain"}
+             "subfinder-passive": "domain", "amass-passive": "domain", "document-review": "document"}
     found = [(match.start(), name) for name in kinds
              if (match := re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", lower))]
     explicit = [name for _, name in sorted(found)]
     if len(explicit) > 1 and not re.search(r"\b(jangan|tanpa|kecuali|hindari|bukan|not|without)\b", lower):
         existing = {item.tool: item for item in slots.selections}
         slots.selections = [existing.get(name, ToolSelection(tool=name)) for name in explicit]
+    elif len(explicit) == 1 and not re.search(r"\b(jangan|tanpa|kecuali|hindari|bukan|not|without)\b", lower):
+        slots.tool = explicit[0]
+        slots.selections = []
     def fill(selection):
         kind = kinds.get(selection.tool)
         candidates = {"url": urls, "ip": ips, "domain": domains}.get(kind, [])
@@ -107,6 +153,46 @@ def complete_explicit_slots(slots, user_text):
                  if re.search(rf"(?<![\w]){name}(?![\w])", lower)]
         if roles:
             slots.specialists = roles
+    return slots
+
+
+def apply_url_va_profile(slots, user_text):
+    """Choose a bounded URL baseline only for a general VA request.
+
+    Explicit tool requests stay on the existing path. The baseline does not
+    derive new hosts, IPs, ports, credentials, or active tests from a URL.
+    """
+    outside_urls = without_urls(user_text)
+    if not VA_REQUEST.search(outside_urls):
+        return slots
+    # Do not turn a negative or constrained request into a broader baseline.
+    if re.search(r"\b(?:jangan|tanpa|kecuali|hindari|bukan|not|without|except|exclude)\b", outside_urls, re.I):
+        slots._va_constrained = True
+        slots.tool, slots.selections = 'unsupported', []
+        return slots
+    names = ToolName.__args__
+    if any(name != 'unsupported' and re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", outside_urls, re.I)
+           for name in names):
+        return slots
+    urls = list(dict.fromkeys(re.findall(r"https?://[^\s<>\"']+", user_text, re.I)))
+    target = urls[0] if len(urls) == 1 else ''
+    # When the user answers the target question with one URL, that explicit
+    # choice resolves an earlier message that mentioned several URLs.
+    latest = user_text.rsplit('\n', 1)[-1]
+    latest_urls = list(dict.fromkeys(re.findall(r"https?://[^\s<>\"']+", latest, re.I)))
+    if len(urls) > 1 and len(latest_urls) == 1 and not VA_REQUEST.search(without_urls(latest)):
+        target = latest_urls[0]
+    slots._url_va_profile = True
+    # HTML inventory is implemented only for HTTPS on port 443; keep the
+    # stricter production policy and never change the URL to make it fit.
+    try:
+        parsed = urlsplit(target) if target else None
+        inventory_supported = not parsed or (parsed.scheme.lower() == 'https' and (parsed.port or 443) == 443)
+    except ValueError:
+        inventory_supported = False
+    tools = ['http-head', 'inventory-html'] if slots.environment != 'production_readonly' and inventory_supported else ['http-head']
+    slots.tool = 'unsupported'
+    slots.selections = [ToolSelection(tool=tool, target=target) for tool in tools]
     return slots
 
 
@@ -130,7 +216,7 @@ async def security_slots(prompt, history, model):
         raise ValueError("Router tidak boleh memanggil tool.")
     try:
         slots = SecuritySlots.model_validate_json(result["content"])
-        user_text = "\n".join([*(item.content for item in history if item.role == "user"), prompt])
+        user_text = relevant_security_text(prompt, history)
         if slots.target and slots.target.casefold() not in user_text.casefold():
             slots.target = ""
         if slots.ports and any(not re.search(rf"(?<!\d){port}(?!\d)", user_text) for port in slots.ports):
@@ -145,7 +231,7 @@ async def security_slots(prompt, history, model):
                 selection.target = ""
             if selection.ports and any(not re.search(rf"(?<!\d){port}(?!\d)", user_text) for port in selection.ports):
                 selection.ports = []
-        lower = user_text.casefold()
+        lower = without_targets(user_text).casefold()
         env_patterns = {"lab": r"\blab(?:oratory)?\b", "development": r"\b(development|dev)\b",
                         "staging": r"\bstaging\b", "uat": r"\buat\b",
                         "production_readonly": r"\b(production|produksi)\b.*\b(read.only|hanya.baca)\b"}
@@ -155,7 +241,7 @@ async def security_slots(prompt, history, model):
                          "greybox": r"\bgr[ae]y[ -]?box\b"}
         if slots.assessment_mode and not re.search(mode_patterns[slots.assessment_mode], lower):
             slots.assessment_mode = ""
-        return complete_explicit_slots(slots, user_text)
+        return apply_url_va_profile(complete_explicit_slots(slots, user_text), user_text)
     except ValueError as exc:
         raise ValueError("Parameter pemeriksaan tidak dapat dibaca. Jelaskan target dan jenis pemeriksaan.") from exc
 

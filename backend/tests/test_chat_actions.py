@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from auto_governance import create_approved_job, create_approved_jobs, prepare_plan
-from chat_orchestrator import SecuritySlots, ToolSelection, complete_explicit_slots, security_slots
+from chat_orchestrator import VA_REQUEST, SecuritySlots, ToolSelection, complete_explicit_slots, security_slots, without_urls
 from contracts import HistoryMessage
 from deep_analysis import grounded_output
 from engagements import EngagementStore
@@ -75,17 +75,83 @@ class ChatActionTests(unittest.TestCase):
                                      "Port 8080 terbuka."],
                      "limitations":["Hanya satu HEAD."], "recommendations":["Tambahkan Content-Security-Policy.", "Aktifkan HSTS."]}
         result = grounded_output(candidate, source)
-        self.assertEqual(result["summary"], "CSP tidak terlihat pada respons.")
-        self.assertEqual(len(result["observations"]), 1)
-        self.assertIn("content-security-policy", result["observations"][0])
-        self.assertEqual(result["recommendations"], ["Tambahkan Content-Security-Policy."])
+        self.assertNotIn("Catatan model", result["summary"])  # restates a fact already rendered from evidence
+        self.assertIn("Header tidak ada: CSP.", result["observations"])
+        self.assertNotIn("nginx", str(result["observations"]))
+        self.assertIn("Tambahkan Content-Security-Policy.", result["recommendations"])
+        self.assertNotIn("Aktifkan HSTS.", result["recommendations"])
         removed = " ".join(result["limitations"])
         self.assertIn("4 pernyataan model dihapus", removed)
         for term in ("cookie", "HSTS", "port 8080"):
             self.assertIn(term, removed)
         no_cookie = grounded_output({"summary":"Tidak ada cookie yang teramati.", "observations":["Respons diterima."],
                                      "limitations":["l"], "recommendations":[]}, source)
-        self.assertEqual(no_cookie["summary"], "Tidak ada cookie yang teramati.")
+        self.assertNotIn("Catatan model", no_cookie["summary"])
+        self.assertIn("Cookie tercatat: tidak ada Set-Cookie pada respons ini.", no_cookie["observations"])
+
+    def test_inventory_counts_are_derived_from_distinct_origins_and_legacy_reports(self):
+        from analysis_grounding import grounded_output, reviewed_report, inventory_origin_counts
+        source = {"evidence_id":"inventory-1", "target":{"value":"https://example.test/path"},
+                  "result":{"tool":"inventory-html", "target":"https://example.test/path", "candidates":[
+                      {"url":"https://EXAMPLE.test:443/", "contacted":False},
+                      {"url":"https://fonts.example/", "contacted":False},
+                      {"url":"https://cdn.example/", "contacted":False},
+                      {"url":"https://cdn.example:443/a", "contacted":False}]}}
+        self.assertEqual(inventory_origin_counts(source), {"total":3, "same_origin":1, "same_host_other_origin":0, "external":2,
+                                                           "external_hosts":2, "recorded":4, "truncated":False})
+        candidate = {"summary":"Tiga kandidat URL eksternal teridentifikasi.",
+                     "observations":[{"statement":"Ada 3 kandidat eksternal.", "evidence_quote":"https://cdn.example/"}],
+                     "limitations":["Satu GET."], "recommendations":[]}
+        output = grounded_output(candidate, source)
+        self.assertNotIn("Tiga kandidat URL eksternal", output['summary'])
+        self.assertIn("3 origin kandidat unik: 1 sama dengan origin target, dan 2 origin eksternal (di 2 host selain host target).", output['summary'])
+        self.assertNotIn("Ada 3 kandidat eksternal", str(output['observations']))
+        legacy = reviewed_report({"grounding_version":2, "source":source, "output":candidate})
+        self.assertEqual(legacy['grounding_status'], 'legacy_rechecked')
+        self.assertNotIn("Tiga kandidat URL eksternal", legacy['output']['summary'])
+        self.assertIn("1 sama dengan origin target, dan 2 origin eksternal", legacy['output']['summary'])
+        source['result']['candidates'].append({'url':'not-a-url'})
+        self.assertIsNone(inventory_origin_counts(source))
+
+    def test_same_host_other_scheme_is_not_external_and_truncation_is_disclosed(self):
+        from analysis_grounding import grounded_output, inventory_origin_counts
+        urls = ["https://example.test/", "http://example.test/", "https://example.test:8443/",
+                "https://cdn.example/", "http://cdn.example/", "https://www.example.test/"]
+        source = {"evidence_id":"inventory-2", "target":{"value":"https://example.test/"},
+                  "result":{"tool":"inventory-html", "target":"https://example.test/",
+                            "candidates":[{"url":url, "contacted":False} for url in urls]}}
+        counts = inventory_origin_counts(source)
+        self.assertEqual((counts["total"], counts["same_origin"], counts["same_host_other_origin"], counts["external"],
+                          counts["external_hosts"]), (6, 1, 2, 3, 2))
+        summary = grounded_output({"summary":"x", "observations":[], "limitations":[], "recommendations":[]}, source)["summary"]
+        self.assertIn("6 origin kandidat unik: 1 sama dengan origin target, 2 pada host target dengan skema/port berbeda, "
+                      "dan 3 origin eksternal (di 2 host selain host target).", summary)
+        self.assertNotIn("dibatasi", summary)
+        source["result"]["candidates"] = [{"url":f"https://h{i}.example/", "contacted":False} for i in range(40)]
+        summary = grounded_output({"summary":"x", "observations":[], "limitations":[], "recommendations":[]}, source)["summary"]
+        self.assertIn("40 origin eksternal (di 40 host", summary)
+        self.assertIn("dibatasi 40 entri oleh adapter", summary)
+
+    def test_origin_claims_are_grounded_for_js_bundle_and_rejected_for_head(self):
+        from analysis_grounding import grounded_output
+        bundle = {"evidence_id":"js-1", "target":{"value":"https://example.test/app.js"},
+                  "result":{"tool":"js-bundle-inventory", "target":"https://example.test/app.js", "status_code":200,
+                            "candidate_origins":["https://example.test/", "https://api.example.test/", "https://cdn.example/"],
+                            "candidate_api_paths":["/api/users"]}}
+        output = grounded_output({"summary":"Bundle memuat 5 origin eksternal.",
+                                  "observations":[{"statement":"Path /api/users tercatat.", "evidence_quote":"/api/users"}],
+                                  "limitations":[], "recommendations":[]}, bundle)
+        self.assertNotIn("5 origin eksternal", output["summary"])
+        self.assertIn("3 origin kandidat unik: 1 sama dengan origin target, dan 2 origin eksternal (di 2 host selain host target).", output["summary"])
+        head = {"evidence_id":"head-1", "target":{"value":"https://example.test/"},
+                "result":{"http_status":200, "headers":{"content-security-policy":"missing"}}}
+        output = grounded_output({"summary":"Situs memuat 4 origin eksternal. Respons HTTP 200 diterima.",
+                                  "observations":["Terdapat domain pihak ketiga pada halaman.", "CORS tidak teramati."],
+                                  "limitations":[], "recommendations":[]}, head)
+        self.assertNotIn("origin eksternal", output["summary"])
+        self.assertIn("HTTP 200", output["summary"])
+        self.assertNotIn("pihak ketiga", str(output["observations"]))
+        self.assertIn("CORS tidak teramati.", output["observations"])
 
     def test_confirmed_plan_uses_existing_policy_and_creates_job(self):
         engagements = EngagementStore(self.directory)
@@ -204,7 +270,162 @@ class ChatActionTests(unittest.TestCase):
         self.assertIn("lab", question)
 
 
+class SessionFactTests(unittest.TestCase):
+    REPORT = ("**Ringkasan**\nModel menulis 9 origin.\n\n**Observasi**\n- Status HTTP: 200.\n- Header tidak ada: CSP.\n"
+              "- Model: ada 9 origin eksternal.\n\nJob: j1 · Analisis: a1\nEvidence: e1 · SHA-256: abc\n\n---\n\n"
+              "**Observasi**\n- Evidence inventaris mencatat 5 origin kandidat unik: 1 sama dengan origin target, dan 4 origin eksternal (di 4 host selain host target).\n\n"
+              "Job: j2 · Analisis: a2\nEvidence: e2 · SHA-256: def\n\nEngagement: g1 · Analisis memerlukan review manusia.")
+
+    def test_facts_are_copied_from_user_text_and_report_lines_only(self):
+        from session_context import session_facts
+        history = [{"role": "user", "content": "Jalankan VA pada https://a.test/ dan 192.0.2.4"},
+                   {"role": "assistant", "content": "Untuk menyiapkan pemeriksaan, mohon sebutkan lingkungan dan mode."},
+                   {"role": "user", "content": "staging, BlackBox"},
+                   {"role": "assistant", "content": self.REPORT},
+                   {"role": "assistant", "content": "Jawaban biasa: Evidence: palsu tanpa penanda laporan."}]
+        facts = session_facts(history)
+        self.assertIn("Target yang disebut pengguna: https://a.test/, 192.0.2.4 (terakhir: 192.0.2.4)", facts)
+        self.assertIn("lingkungan staging · mode BlackBox", facts)
+        self.assertIn("Evidence inventaris mencatat 5 origin kandidat unik", facts)
+        self.assertIn("Evidence: e2 · SHA-256: def", facts)
+        self.assertNotIn("9 origin", facts)
+        self.assertNotIn("palsu", facts)
+        self.assertEqual(session_facts([{"role": "user", "content": "Halo"}]), "")
+        ambiguous = session_facts([{"role": "user", "content": "staging"}, {"role": "user", "content": "lab atau staging?"}])
+        self.assertIn("lingkungan staging", ambiguous)
+
+    def test_facts_reach_the_model_when_old_turns_do_not_fit(self):
+        from model_runtime import bounded_messages
+        history = [{"role": "user", "content": "Jalankan VA pada https://a.test/ staging BlackBox"},
+                   {"role": "assistant", "content": self.REPORT}]
+        history += [{"role": role, "content": "Catatan rutin " + "x" * 1500} for _ in range(20) for role in ("user", "assistant")]
+        # No word overlap with the report, so relevance-based selection cannot recover it.
+        plain = bounded_messages("sistem", "Sebutkan angkanya tadi.", history)
+        self.assertNotIn("5 origin kandidat unik", str(plain))
+        remembered = bounded_messages("sistem", "Sebutkan angkanya tadi.", history, facts=True)
+        self.assertIn("5 origin kandidat unik", remembered[0]["content"])
+        self.assertIn("https://a.test/", remembered[0]["content"])
+
+
 class ExtractionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_general_url_va_profile_requires_explicit_mode_and_environment(self):
+        answer = {"content": '{"tool":"unsupported","environment":"staging","assessment_mode":"blackbox"}', "tool_calls": []}
+        request = "Jalankan Vulnerabilities Assessment pada url ini https://circular-sync-staging.web.app/"
+        with patch("chat_orchestrator.runtime.chat", new=AsyncMock(return_value=answer)):
+            slots = await security_slots(request, [], "model")
+            self.assertEqual(slots.environment, "")
+            self.assertEqual(slots.assessment_mode, "")
+            self.assertEqual([x.tool for x in slots.selections], ["http-head", "inventory-html"])
+            _, question = prepare_plan(slots)
+            self.assertIn("lingkungan", question)
+            self.assertIn("BlackBox", question)
+            domain_only = await security_slots("VA circular-sync-staging.example.test", [], "model")
+            self.assertEqual(domain_only.environment, "")
+            history = [HistoryMessage(role="user", content=request)]
+            slots = await security_slots("Lingkungan staging, mode BlackBox", history, "model")
+            plan, question = prepare_plan(slots)
+        self.assertIsNone(question)
+        self.assertTrue(plan["url_va_profile"])
+        self.assertEqual([job["tool"] for job in plan["jobs"]], ["http-head", "inventory-html"])
+        self.assertTrue(all(job["target"]["value"] == "https://circular-sync-staging.web.app/" for job in plan["jobs"]))
+        self.assertTrue(all(job["ports"] == [443] for job in plan["jobs"]))
+
+    async def test_vague_security_check_without_url_asks_for_target(self):
+        answer = {"content": '{"tool":"unsupported","environment":"staging"}', "tool_calls": []}
+        request = "Tolong cek celah keamanan website staging saya."
+        with patch("chat_orchestrator.runtime.chat", new=AsyncMock(return_value=answer)):
+            slots = await security_slots(request, [], "model")
+            self.assertEqual([x.tool for x in slots.selections], ["http-head", "inventory-html"])
+            self.assertTrue(all(not x.target for x in slots.selections))
+            _, question = prepare_plan(slots)
+            self.assertNotIn("belum tersedia", question)
+            self.assertIn("URL HTTP(S) lengkap", question)
+            self.assertIn("mode analisis", question)
+            self.assertNotIn("lingkungan (", question)  # "staging" was stated outside any URL.
+            history = [HistoryMessage(role="user", content=request), HistoryMessage(role="assistant", content=question)]
+            slots = await security_slots("https://staging.example.test/ mode BlackBox", history, "model")
+            plan, question = prepare_plan(slots)
+        self.assertIsNone(question)
+        self.assertEqual([job["tool"] for job in plan["jobs"]], ["http-head", "inventory-html"])
+        self.assertTrue(all(job["target"]["value"] == "https://staging.example.test/" for job in plan["jobs"]))
+        for phrase in ("cek keamanan https://a.test/", "periksa kerentanan https://a.test/", "scan celah keamanan https://a.test/",
+                       "check security https://a.test/", "ada celah keamanan di https://a.test/?"):
+            self.assertTrue(VA_REQUEST.search(without_urls(phrase)), phrase)
+        for phrase in ("Jelaskan apa itu XSS", "cek kode auth.py", "Apa kabar?"):
+            self.assertFalse(VA_REQUEST.search(phrase), phrase)
+
+    async def test_va_profile_respects_explicit_tools_modes_and_production(self):
+        answer = {"content": '{"tool":"unsupported"}', "tool_calls": []}
+        with patch("chat_orchestrator.runtime.chat", new=AsyncMock(return_value=answer)):
+            slots = await security_slots("VA https://example.test/ production read-only BlackBox", [], "model")
+            plan, question = prepare_plan(slots)
+            self.assertIsNone(question)
+            self.assertEqual([job["tool"] for job in plan["jobs"]], ["http-head"])
+            slots = await security_slots("VA http://example.test/ staging BlackBox", [], "model")
+            plan, question = prepare_plan(slots)
+            self.assertIsNone(question)
+            self.assertEqual([job["tool"] for job in plan["jobs"]], ["http-head"])
+            slots = await security_slots("VA https://example.test:8443/ staging BlackBox", [], "model")
+            _, question = prepare_plan(slots)
+            self.assertIn("80 atau 443", question)
+            slots = await security_slots("VA https://example.test/ staging GreyBox", [], "model")
+            _, question = prepare_plan(slots)
+            self.assertIn("auth-two-session", question)
+            slots = await security_slots("VA https://example.test/ staging BlackBox tanpa GET", [], "model")
+            self.assertFalse(slots.selections)
+            invented = {"content": '{"tool":"nuclei-head"}', "tool_calls": []}
+            with patch("chat_orchestrator.runtime.chat", new=AsyncMock(return_value=invented)):
+                slots = await security_slots("VA https://example.test/ staging BlackBox jangan nuclei-head", [], "model")
+            self.assertEqual(slots.tool, "unsupported")
+            self.assertFalse(slots.selections)
+            _, clarification = prepare_plan(slots)
+            history = [HistoryMessage(role="user", content="VA https://example.test/ staging BlackBox jangan nuclei-head"),
+                       HistoryMessage(role="assistant", content=clarification)]
+            slots = await security_slots("http-head https://example.test/ staging BlackBox", history, "model")
+            plan, question = prepare_plan(slots)
+            self.assertIsNone(question)
+            self.assertEqual(plan["tool"], "http-head")
+            slots = await security_slots("VA https://example.test/ staging BlackBox dengan nuclei-head", [], "model")
+            self.assertFalse(slots._url_va_profile)
+
+    async def test_va_profile_never_selects_between_multiple_urls(self):
+        answer = {"content": '{"tool":"unsupported"}', "tool_calls": []}
+        with patch("chat_orchestrator.runtime.chat", new=AsyncMock(return_value=answer)):
+            slots = await security_slots("VA https://a.example/ dan https://b.example/ lab blackbox", [], "model")
+        _, question = prepare_plan(slots)
+        self.assertIn("URL", question)
+        history = [HistoryMessage(role="user", content="VA https://a.example/ dan https://b.example/ lab blackbox"),
+                   HistoryMessage(role="assistant", content=question)]
+        with patch("chat_orchestrator.runtime.chat", new=AsyncMock(return_value=answer)):
+            slots = await security_slots("Gunakan https://b.example/", history, "model")
+        plan, question = prepare_plan(slots)
+        self.assertIsNone(question)
+        self.assertTrue(all(job["target"]["value"] == "https://b.example/" for job in plan["jobs"]))
+
+    async def test_new_va_ignores_previous_target_environment_and_tools(self):
+        answer = {"content": '{"tool":"nmap","target":"192.0.2.4","ports":[443],"environment":"lab","assessment_mode":"blackbox"}', "tool_calls": []}
+        history = [HistoryMessage(role="user", content="Jalankan nmap 192.0.2.4 port 443 di lab BlackBox"),
+                   HistoryMessage(role="assistant", content="Selesai.")]
+        with patch("chat_orchestrator.runtime.chat", new=AsyncMock(return_value=answer)):
+            slots = await security_slots("VA https://new-staging.example.test/", history, "model")
+        self.assertEqual(slots.environment, "")
+        self.assertEqual(slots.assessment_mode, "")
+        self.assertEqual([selection.tool for selection in slots.selections], ["http-head", "inventory-html"])
+        self.assertTrue(all(selection.target == "https://new-staging.example.test/" for selection in slots.selections))
+
+    async def test_explicit_reference_reuses_va_scope_from_same_conversation(self):
+        answer = {"content": '{"tool":"unsupported"}', "tool_calls": []}
+        history = [HistoryMessage(role="user", content="VA https://example.test/"),
+                   HistoryMessage(role="assistant", content="Sebutkan lingkungan dan mode."),
+                   HistoryMessage(role="user", content="staging BlackBox"),
+                   HistoryMessage(role="assistant", content="Laporan selesai.")]
+        with patch("chat_orchestrator.runtime.chat", new=AsyncMock(return_value=answer)):
+            slots = await security_slots("Ulangi VA pada target yang sama", history, "model")
+        plan, question = prepare_plan(slots)
+        self.assertIsNone(question)
+        self.assertEqual(plan['environment'], 'staging')
+        self.assertTrue(all(job['target']['value'] == 'https://example.test/' for job in plan['jobs']))
+
     async def test_model_cannot_invent_target_or_ports(self):
         answer = {"content": '{"tool":"tcp-connect","target":"192.0.2.4","ports":[22,443],"environment":"lab","assessment_mode":"blackbox"}', "tool_calls": []}
         with patch("chat_orchestrator.runtime.chat", new=AsyncMock(return_value=answer)):

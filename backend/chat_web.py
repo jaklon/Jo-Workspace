@@ -185,7 +185,7 @@ async def web_context(prompt, mode, model, history=()):
     image_notice = (f"Ada {len(images)} kandidat tautan gambar pada galeri terpisah di UI. "
                     "Sebagian tautan mungkin gagal dimuat; jangan menyatakan tidak ada gambar jika kandidat tersedia. "
                     "Jangan mengklaim telah melihat isi visual gambar hanya dari URL, judul, atau alt.\n\n") if plan['images'] else ''
-    messages = bounded_messages(WEB_SYSTEM, prompt, history, image_notice + '\n\n'.join(context), thinking=True)
+    messages = bounded_messages(WEB_SYSTEM, prompt, history, image_notice + '\n\n'.join(context), thinking=True, facts=True)
     return {'messages': messages, 'sources': sources, 'images': images[:8], 'coverage': None}
 
 

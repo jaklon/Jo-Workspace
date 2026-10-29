@@ -118,6 +118,27 @@ class DocumentTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             bounded_messages("system", "x" * 10000)
 
+    def test_history_keeps_relevant_older_context_despite_long_report(self):
+        import config
+        from contracts import HistoryMessage
+        from session_context import cost
+        history = [HistoryMessage(role='user', content='Kode proyek saya adalah MERANTI-842.')]
+        history.extend(HistoryMessage(role='assistant' if i % 2 else 'user', content=f'Percakapan rutin {i}.') for i in range(24))
+        history.append(HistoryMessage(role='assistant', content='Ringkasan laporan.\n' + 'Data panjang. ' * 900))
+        messages = bounded_messages('system', 'Apa kode proyek saya?', history, thinking=True)
+        self.assertTrue(any('MERANTI-842' in item['content'] for item in messages))
+        self.assertTrue(any('Ringkasan laporan' in item['content'] for item in messages))
+        self.assertLessEqual(sum(cost(item) for item in messages[1:-1]),
+                             config.CONTEXT_TOKENS - config.OUTPUT_TOKENS - config.THINKING_TOKENS - 200
+                             - sum(len(item['content'].encode('utf-8')) + 16 for item in (messages[0], messages[-1])))
+
+    def test_history_accepts_up_to_one_session_retention_limit(self):
+        from contracts import ChatPayload
+        messages = [{'role':'user', 'content':str(i)} for i in range(100)]
+        self.assertEqual(len(ChatPayload(prompt='lanjut', history=messages).history), 100)
+        with self.assertRaises(ValueError):
+            ChatPayload(prompt='lanjut', history=messages + [messages[0]])
+
     def test_internal_reasoning_is_not_returned(self):
         self.assertEqual(clean_answer("<think>secret</think>Jawaban"), "Jawaban")
         self.assertEqual(clean_answer("Thinking Process: secret\nFinal Answer: Aman"), "Aman")
@@ -265,6 +286,23 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(self.events(response)[-1]["type"], "done")
             self.assertEqual(chat.await_args.args[0], "chosen:latest")
 
+    def test_chat_session_history_reaches_model_and_does_not_cross_sessions(self):
+        captured = []
+        async def chunks(model, messages, **kwargs):
+            captured.append(messages)
+            yield {"message": {"content": "Jawaban."}}
+            yield {"done": True}
+        with patch("main.classify", new=AsyncMock(return_value="chat")), \
+             patch("main.runtime.chunks", new=chunks):
+            previous = [{"role":"user", "content":"Kode proyek saya MERANTI-842."},
+                        {"role":"assistant", "content":"Saya mencatat kode itu."}]
+            for session, history in (("memory-a", previous), ("memory-b", [])):
+                response = self.client.post("/api/chat", headers=self.headers,
+                    json={"prompt":"Apa kode proyek saya?", "session_id":session, "unified":True, "history":history})
+                self.assertEqual(self.events(response)[-1]['type'], 'done')
+        self.assertTrue(any('MERANTI-842' in message['content'] for message in captured[0]))
+        self.assertFalse(any('MERANTI-842' in message['content'] for message in captured[1]))
+
     def test_unified_coding_waits_for_confirmation_and_rejects_replay(self):
         with patch("main.classify", new=AsyncMock(return_value="coding")), \
              patch("main.execute_agent_pipeline", new=AsyncMock(return_value={"result": "done", "proposals": []})) as agent:
@@ -312,7 +350,7 @@ class ApiTests(unittest.TestCase):
                 self.assertEqual(events[-1]["type"], "done", events)
                 report = next(e["result"] for e in events if e["type"] == "result")
                 self.assertIn("Pemeriksaan selesai", report)
-                self.assertIn("Port 443 tertutup", report)
+                self.assertIn("Port lain: 443 (closed).", report)
                 claims = report.split("**Keterbatasan**")[0]
                 for hallucinated in ("HttpOnly", "8080", "Nginx"):
                     self.assertNotIn(hallucinated, claims)
@@ -363,6 +401,41 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(events[-1]["type"], "done", events)
             result = next(e["result"] for e in events if e["type"] == "result")
             self.assertEqual(result.count("Evidence:"), 2)
+            scanner.assert_awaited_once(); web.assert_awaited_once()
+
+    def test_general_url_va_fills_slots_then_runs_baseline_only_after_confirmation(self):
+        from chat_orchestrator import SecuritySlots
+        from config import MODELS
+        output = {"summary":"Selesai", "observations":["Observasi"], "limitations":["Fixture"], "recommendations":[]}
+        async def model_chat(model, messages, **kwargs):
+            if kwargs.get("format_schema") == SecuritySlots.model_json_schema():
+                return {"content": json.dumps({"tool":"unsupported"}), "tool_calls": []}
+            return {"content":json.dumps(output), "tool_calls":[]}
+        with patch("main.classify", new=AsyncMock(return_value="security")), \
+             patch("chat_orchestrator.runtime.chat", new=AsyncMock(side_effect=model_chat)), \
+             patch("bounded_scan.run_scan", new=AsyncMock(return_value={"tool":"inventory-html", "candidates":[]})) as scanner, \
+             patch("web_checks.probe", new=AsyncMock(return_value={"http_status":200})) as web, \
+             patch("deep_analysis.installed_models", new=AsyncMock(return_value=[{"name":"security-test", "digest":"synthetic"}])), \
+             patch.dict(MODELS, {"security":"security-test"}):
+            request = "Jalankan Vulnerabilities Assessment pada URL https://demo-staging.example.test/"
+            base = {"session_id":"va-test", "project_id":"89de83d0-8729-4b0a-b21d-9fcafc444095", "unified":True}
+            first = self.events(self.client.post("/api/chat", headers=self.headers, json={**base, "prompt":request}))
+            question = next(event["result"] for event in first if event["type"] == "result")
+            self.assertIn("lingkungan", question)
+            self.assertIn("BlackBox", question)
+            self.assertFalse(any(event["type"] == "action_proposal" for event in first))
+            scanner.assert_not_awaited(); web.assert_not_awaited()
+            history = [{"role":"user", "content":request}, {"role":"assistant", "content":question}]
+            second = self.events(self.client.post("/api/chat", headers=self.headers,
+                json={**base, "prompt":"lingkungan staging, mode BlackBox", "history":history}))
+            action = next(event["action"] for event in second if event["type"] == "action_proposal")
+            self.assertEqual(action["tools"][:2], ["http-head", "inventory-html"])
+            self.assertIn("bukan asesmen kerentanan menyeluruh", action["summary"])
+            scanner.assert_not_awaited(); web.assert_not_awaited()
+            confirmed = self.events(self.client.post("/api/chat/actions/"+action["id"]+"/confirm", headers=self.headers,
+                json={"session_id":"va-test", "approve":True}))
+            self.assertEqual(confirmed[-1]["type"], "done", confirmed)
+            self.assertEqual(next(event["result"] for event in confirmed if event["type"] == "result").count("Evidence:"), 2)
             scanner.assert_awaited_once(); web.assert_awaited_once()
 
     def test_unified_whitebox_and_greybox_analyze_imported_evidence(self):

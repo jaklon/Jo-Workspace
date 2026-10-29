@@ -28,10 +28,31 @@ TOOLS = {
 
 def prepare_plan(slots):
     if slots.selections:
+        if slots._url_va_profile and not slots.selections[0].target:
+            # Ask for every missing slot at once; the URL is never guessed from a hostname or wording.
+            missing = ["URL HTTP(S) lengkap dari website yang akan diperiksa"]
+            if not slots.environment:
+                missing.append("lingkungan (lab, development, staging, UAT, atau production read-only)")
+            if not slots.assessment_mode:
+                missing.append("mode analisis (BlackBox, WhiteBox, atau GreyBox)")
+            return None, "Untuk menyiapkan pemeriksaan, mohon sebutkan " + ", ".join(missing[:-1]) + (" dan " if len(missing) > 1 else "") + missing[-1] + "."
         if not slots.environment or not slots.assessment_mode:
-            return None, "Mohon sebutkan lingkungan (lab, development, staging, UAT, atau production read-only) dan mode analisis BlackBox, WhiteBox, atau GreyBox."
+            missing = []
+            if not slots.environment:
+                missing.append("lingkungan (lab, development, staging, UAT, atau production read-only)")
+            if not slots.assessment_mode:
+                missing.append("mode analisis (BlackBox, WhiteBox, atau GreyBox)")
+            return None, "Untuk menyiapkan pemeriksaan, mohon sebutkan " + " dan ".join(missing) + "."
         if slots.assessment_mode in ("whitebox", "greybox") and not any(item.tool == "document-review" or (slots.assessment_mode == "whitebox" and item.tool == "monitoring-local") or (slots.assessment_mode == "greybox" and item.tool == "auth-two-session") for item in slots.selections):
-            return None, "WhiteBox/GreyBox memerlukan satu review dokumen dengan evidence yang relevan."
+            return None, ("Untuk WhiteBox, lampirkan dokumen atau kode dan minta document-review. "
+                          "Untuk GreyBox, pilih document-review dengan evidence yang relevan atau auth-two-session dengan dua alias akun uji.")
+        if slots._url_va_profile and slots.selections[0].target:
+            try:
+                parsed = urlsplit(slots.selections[0].target)
+                if parsed.scheme.lower() not in ('http', 'https') or (parsed.port or (443 if parsed.scheme.lower() == 'https' else 80)) not in (80, 443):
+                    return None, "Paket VA URL dasar hanya mendukung URL publik pada port 80 atau 443."
+            except ValueError:
+                return None, "URL atau port pada target tidak valid."
         plans = []
         for selected in slots.selections:
             single = slots.model_copy(update={"selections": [], "tool": selected.tool,
@@ -46,8 +67,11 @@ def prepare_plan(slots):
                 raise ValueError("Tool dan target yang sama tidak boleh diulang dalam satu rencana.")
             plans.append(plan)
         return {**plans[0], "jobs": plans, "assessment_mode": slots.assessment_mode,
+                "url_va_profile": slots._url_va_profile,
                 "specialists": list(dict.fromkeys(slots.specialists))}, None
     if slots.tool == "unsupported":
+        if slots._va_constrained:
+            return None, "Permintaan memuat pengecualian. Ulangi permintaan dengan tool yang ingin dijalankan, URL, lingkungan, dan mode agar rencana sesuai batas yang Anda inginkan."
         return None, "Jenis atau kombinasi tool tersebut belum tersedia di alur chat. Sebutkan satu pemeriksaan yang didukung."
     kind, action, duration, timeout = TOOLS[slots.tool]
     missing = []

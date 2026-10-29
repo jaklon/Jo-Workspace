@@ -11,6 +11,7 @@ Usage (from the project root):
 """
 import argparse
 import json
+import re
 import os
 import shutil
 import sys
@@ -91,9 +92,9 @@ def router_checks(reasoning):
                 plan, question = prepare_plan(slots)
                 detail.update(question=question, plan_tool=(plan or {}).get("tool"),
                               plan_ports=(plan or {}).get("ports"), plan_target=((plan or {}).get("target") or {}).get("value"))
-                ok = bool(question) if outcome == "question" else bool(plan and plan.get("tool") == "tcp-connect"
+                ok = bool(question and "URL" in question and "belum tersedia" not in question) if outcome == "question" else bool(plan and plan.get("tool") == "tcp-connect"
                                                                          and sorted(plan.get("ports", [])) == [1, 11434])
-            record("router: " + prompt[:40], ok, hard=False, **detail)
+            record("router: " + prompt[:40], ok, hard=outcome == "question", **detail)
         except Exception as exc:
             record("router: " + prompt[:40], False, hard=False, error=str(exc)[:300])
 
@@ -160,6 +161,113 @@ def whitebox_review(client, project, model):
     SUMMARY["models"].setdefault(model, {})["whitebox_seconds"] = round(time.monotonic() - started, 1)
 
 
+VA_TARGET = "https://va-fixture.example.test/"
+# Synthetic page: 2 same-origin links, 1 same host over http, 3 external origins on 2 hosts.
+VA_HTML = """<html><head><link href="/style.css" rel="stylesheet"><script src="https://cdn.fixture-cdn.example/lib.js"></script>
+<script src="https://cdn.fixture-cdn.example:8443/x.js"></script></head><body><a href="/login">Login</a>
+<a href="https://va-fixture.example.test/about">About</a><a href="http://va-fixture.example.test/old">Old</a>
+<a href="https://social.fixture.example/share">Share</a><form action="/search"></form></body></html>"""
+
+
+def url_va_end_to_end(client, project):
+    """URL VA package with real routing, slot filling and Deep Analysis; adapters return fixtures."""
+    from unittest.mock import AsyncMock, patch
+    from inventory_adapter import Links
+    from analysis_grounding import inventory_origin_counts
+    links = Links(VA_TARGET)
+    links.feed(VA_HTML)
+    inventory = {"tool": "inventory-html", "target": VA_TARGET, "http_status": 200, "body_sha256": "0" * 64,
+                 "candidates": links.items, "limitation": "Fixture sintetis."}
+    counts = inventory_origin_counts({"result": inventory})
+    expected = (f"{counts['total']} origin kandidat unik: {counts['same_origin']} sama dengan origin target, "
+                f"{counts['same_host_other_origin']} pada host target dengan skema/port berbeda, dan {counts['external']} origin eksternal")
+    record("va: hitungan acuan dari fixture", (counts["total"], counts["same_origin"], counts["same_host_other_origin"],
+                                                counts["external"], counts["external_hosts"]) == (5, 1, 1, 3, 2), counts=counts)
+    session, history = "live-url-va", []
+
+    def chat(prompt):
+        rows = events(client.post("/api/chat", headers=HEADERS, json={
+            "prompt": prompt, "session_id": session, "project_id": project, "unified": True, "history": history}))
+        text = next((r.get("result") or r.get("detail") or "" for r in rows if r["type"] in ("result", "error")), "")
+        history.extend([{"role": "user", "content": prompt}, *([{"role": "assistant", "content": text[:16000]}] if text else [])])
+        return rows, text
+
+    async def scan(plan, *args, **kwargs):
+        if plan["scan"]["tool"] != "inventory-html":
+            raise AssertionError("Paket VA hanya boleh menjalankan inventory-html melalui scanner.")
+        return inventory
+
+    # Same shape as web_checks.probe; header presence only, never values.
+    present = ("strict-transport-security", "x-content-type-options")
+    head = {"adapter": "public-head-1.0", "url": VA_TARGET, "method": "HEAD", "requests": 1, "http_status": 200,
+            "redirect_followed": False, "body_collected": False, "credentials_sent": False,
+            "tls": {"verified": True, "version": "TLSv1.3", "certificate_expires": "Jan  1 00:00:00 2027 GMT"},
+            "checks": [{"check": name, "status": "present" if name in present else "missing", "severity": "info", "review_required": True}
+                       for name in ("strict-transport-security", "content-security-policy", "x-content-type-options",
+                                    "x-frame-options", "referrer-policy", "permissions-policy")]
+                      + [{"check": "https_transport", "status": "verified", "review_required": True}],
+            "cookie_flags": [{"secure": True, "httponly": False, "samesite": True}], "redirect_observed": False, "head_supported": True,
+            "http_configuration": {"cache": {"header_present": False, "no_store": False, "private": False},
+                                   "cors": {"allow_origin_present": False, "wildcard_origin_observed": False, "allow_credentials_true": False}},
+            "limitations": "Satu respons HEAD. Header absen bukan bukti exploit; tidak ada crawling, login, body, atau uji TLS legacy."}
+    with patch("bounded_scan.run_scan", new=AsyncMock(side_effect=scan)), patch("web_checks.probe", new=AsyncMock(return_value=head)):
+        started = time.monotonic()
+        rows, first = chat(f"Jalankan vulnerabilities assessment pada {VA_TARGET}")
+        actions = [r["action"] for r in rows if r["type"] == "action_proposal"]
+        if not actions:
+            record("va: pertanyaan lingkungan/mode", "lingkungan" in first.lower() or "mode" in first.lower(), hard=False, message=first[:300])
+            rows, second = chat("lingkungan staging, mode BlackBox")
+            actions = [r["action"] for r in rows if r["type"] == "action_proposal"]
+        record("va: kartu memakai target dari riwayat sesi", bool(actions) and VA_TARGET in json.dumps(actions[0]),
+               tools=actions[0].get("tools") if actions else None, message=history[-1]["content"][:300] if history else "")
+        if not actions:
+            return
+        rows = events(client.post(f"/api/chat/actions/{actions[0]['id']}/confirm", headers=HEADERS,
+                                  json={"session_id": session, "approve": True}))
+        report = next((row.get("result", "") for row in rows if row["type"] == "result"), "")
+        error = next((row.get("detail", "") for row in rows if row["type"] == "error"), "")
+        history.append({"role": "assistant", "content": report[:16000]})
+        record("va: dua job selesai dengan Deep Analysis", report.count("Evidence:") == 2 and "Deep Analysis gagal" not in report and not error,
+               seconds=round(time.monotonic() - started, 1), error=error, report=report[:2500])
+        inventory_part = next((part for part in report.split("---") if "Inventaris HTML" in part), "")
+        record("va: jumlah origin di laporan sesuai evidence", expected in inventory_part, expected=expected, section=inventory_part[:900])
+        wrong = [line for line in report.splitlines() if "eksternal" in line.lower() and expected not in line
+                 and re.search(r"\d", line) and "Evidence:" not in line]
+        record("va: tidak ada angka origin lain dari model", not wrong, lines=wrong)
+        head_part = next((part for part in report.split("---") if "Respons HEAD" in part), "")
+        expected_facts = ["Header ada: HSTS, X-Content-Type-Options.",
+                          "Header tidak ada: CSP, X-Frame-Options, Referrer-Policy, Permissions-Policy.",
+                          "HTTPS: terverifikasi (TLSv1.3", "Cookie tercatat: 1 Set-Cookie (1 tanpa HttpOnly).",
+                          "Susun Content-Security-Policy"]
+        missing_facts = [fact for fact in expected_facts if fact not in head_part]
+        record("va: laporan HEAD memuat fakta & rekomendasi dari evidence", not missing_facts, missing=missing_facts,
+               section=head_part[:1500])
+        claims = head_part.split("**Keterbatasan**")[0]
+        record("va: tidak ada fakta header di bagian Keterbatasan", not re.search(
+            r"content security policy|x-frame|\bcsp\b", head_part.split("**Keterbatasan**")[-1].split("**Rekomendasi**")[0], re.I),
+            hard=False)
+        record("va: klaim header model tidak bertentangan", "tersedia dan aman" not in claims and "Header ada: CSP" not in claims)
+
+    started = time.monotonic()
+    rows, answer = chat("Dari hasil VA tadi, berapa origin eksternal yang tercatat?")
+    intent = next((r.get("detail") for r in rows if r["type"] == "status" and "Intent" in (r.get("detail") or "")), "")
+    record("memori: pertanyaan lanjutan tanpa mengulang konteks", str(counts["external"]) in answer and not any(
+        r["type"] == "action_proposal" for r in rows), hard=False, intent=intent, answer=answer[:500],
+        seconds=round(time.monotonic() - started, 1))
+    # Long session: filler turns push the report out of the model context window; session facts must keep it.
+    filler = [{"role": role, "content": f"Catatan rapat nomor {i}: " + "detail operasional rutin. " * 60}
+              for i in range(18) for role in ("user", "assistant")]
+    history.extend(filler)
+    started = time.monotonic()
+    rows, answer = chat("Sebutkan lagi jumlah host luar dari pemeriksaan pertama tadi.")
+    record("memori: fakta tetap diingat setelah sesi panjang", str(counts["external"]) in answer or str(counts["external_hosts"]) in answer,
+           hard=False, answer=answer[:500], seconds=round(time.monotonic() - started, 1))
+    rows, _ = chat("Ulangi VA pada target yang sama")
+    actions = [r["action"] for r in rows if r["type"] == "action_proposal"]
+    record("memori: 'target yang sama' memakai URL sebelumnya + kartu baru", bool(actions) and VA_TARGET in json.dumps(actions[0]),
+           hard=False, message=history[-1]["content"][:300])
+
+
 def monitoring(client, project):
     try:
         httpx.get("http://127.0.0.1:9090/-/ready", timeout=2).raise_for_status()
@@ -210,6 +318,7 @@ def main():
         MODELS["security"] = security
         project = str(uuid.uuid4())
         tcp_end_to_end(client, project)
+        url_va_end_to_end(client, str(uuid.uuid4()))
         for model in dict.fromkeys(filter(None, [rabbit, configured_security])):
             whitebox_review(client, str(uuid.uuid4()), model)
         monitoring(client, str(uuid.uuid4()))

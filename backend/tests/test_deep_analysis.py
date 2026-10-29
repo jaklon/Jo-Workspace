@@ -49,7 +49,7 @@ class DeepAnalysisTests(unittest.TestCase):
                 'prompt':'Deep analisis https://project.example/', 'project_id':self.engagement['project_id']})
             self.assertEqual(chat.status_code, 200)
             self.assertIn(report['source']['evidence_id'], chat.text)
-            self.assertIn('Header tidak terlihat', chat.text)
+            self.assertIn('Header tidak ada: CSP.', chat.text)  # rendered from evidence, not model prose
             without_project = self.client.post('/api/chat', headers=self.headers,
                 json={'prompt':'Deep analisis https://project.example/'})
             self.assertIn('Pilih Project', without_project.text)

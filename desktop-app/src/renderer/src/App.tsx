@@ -586,7 +586,7 @@ export default function App(): JSX.Element {
     const sessionId = currentSession.id
     const history = currentMessages
       .filter((m) => m.content.trim() && !m.content.startsWith('⚠️'))
-      .slice(-12)
+      .slice(-100)
       .map(({ role, content }) => ({ role, content: content.slice(0, 16000) }))
     const userText =
       prompt.trim() || (visionUpload ? 'Jelaskan gambar ini.' : 'Ringkas dokumen ini.')

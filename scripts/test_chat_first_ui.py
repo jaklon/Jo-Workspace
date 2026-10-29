@@ -22,7 +22,7 @@ os.environ["AGENT_API_TOKEN"] = "synthetic-ui-test-token-1234567890"
 import uvicorn
 from playwright.sync_api import sync_playwright
 from PIL import Image
-from chat_orchestrator import SecuritySlots, ToolSelection
+from chat_orchestrator import SecuritySlots, ToolSelection, apply_url_va_profile, complete_explicit_slots, relevant_security_text
 from config import MODELS
 from main import app
 
@@ -44,6 +44,13 @@ def main():
         # The two-session adapter runs for real so its three GETs reach the synthetic probe below.
         if plan["scan"]["tool"] == "auth-two-session":
             return await real_scan(plan, *args, **kwargs)
+        if plan["scan"]["tool"] == "inventory-html":
+            return {"tool":"inventory-html", "target":plan["steps"][0]["target"]["value"], "http_status":200, "candidates":[
+                {"kind":"a", "url":"https://fixture-staging.example.test/", "contacted":False},
+                {"kind":"a", "url":"http://fixture-staging.example.test/", "contacted":False},
+                {"kind":"script", "url":"https://cdn.example/", "contacted":False},
+                {"kind":"script", "url":"https://cdn.example:8443/", "contacted":False},
+                {"kind":"a", "url":"https://social.example/", "contacted":False}]}
         return {"tool":"tcp-connect", "target":"192.0.2.4", "ports":[{"port":443,"status":"closed"}]}
     scanner = AsyncMock(side_effect=fake_scan)
     web = AsyncMock(return_value={"http_status":200, "redirect_observed":False})
@@ -131,21 +138,45 @@ def main():
                     page.get_by_label("Kirim pesan").click()
                     page.get_by_label("Rencana tindakan").last.get_by_role("button", name="Setuju & Jalankan").click()
                     page.get_by_label("Lepas fixture.png").wait_for(timeout=30000)
+                    async def va_slots(prompt, history, model):
+                        text = relevant_security_text(prompt, history)
+                        return apply_url_va_profile(complete_explicit_slots(SecuritySlots(), text), text)
+                    slots_mock.side_effect = va_slots
+                    page.get_by_label("Pesan untuk AI").fill("Jalankan Vulnerabilities Assessment pada https://fixture-staging.example.test/")
+                    page.get_by_label("Kirim pesan").click()
+                    page.get_by_text("Untuk menyiapkan pemeriksaan, mohon sebutkan", exact=False).last.wait_for(timeout=20000)
+                    page.get_by_label("Pesan untuk AI").fill("lingkungan staging dan mode BlackBox")
+                    page.get_by_label("Kirim pesan").click()
+                    va_card = page.get_by_label("Rencana tindakan").last
+                    va_card.get_by_text("Paket VA URL dasar", exact=False).wait_for(timeout=20000)
+                    assert "http-head" in va_card.inner_text() and "inventory-html" in va_card.inner_text()
+                    scan_before, web_before = scanner.await_count, web.await_count
+                    report_count = page.get_by_role("button", name="Lihat Detail di Security Workspace").count()
+                    va_card.get_by_role("button", name="Setuju & Jalankan").click()
+                    page.get_by_role("button", name="Lihat Detail di Security Workspace").nth(report_count).wait_for(timeout=30000)
+                    assert scanner.await_count == scan_before + 1 and web.await_count == web_before + 1
+                    page.get_by_text("5 origin kandidat unik: 1 sama dengan origin target, 1 pada host target dengan skema/port berbeda, "
+                                     "dan 3 origin eksternal (di 2 host selain host target).", exact=False).last.wait_for(timeout=10000)
+                    slots_mock.side_effect = None
                     if width < 1024: page.get_by_label("Buka sidebar").click()
                     page.get_by_role("button", name="Security Workspace Riwayat", exact=True).click()
                     page.get_by_text("Security Workspace · Riwayat dan audit").wait_for(timeout=10000)
                     page.locator("select").first.select_option(label="Auto Security Workspace")
                     page.get_by_text("Riwayat Job").wait_for(timeout=10000)
-                    page.get_by_text("Chat · auth-two-session").wait_for(timeout=15000)
+                    page.get_by_text("Chat · inventory-html").wait_for(timeout=15000)
                     page.get_by_role("button", name="Laporan & Audit RoE").click()
-                    page.get_by_text("Spesialis reporting · review evidence").wait_for(timeout=10000)
+                    page.get_by_text("Deep Analysis ·", exact=False).first.wait_for(timeout=10000)
                     assert not errors, errors
                     assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth + 1")
-                    print(f"UI {width}x{height}: confirmation, multi-tool, document, image, WhiteBox, GreyBox, specialist, dashboard OK", flush=True)
+                    print(f"UI {width}x{height}: confirmation, multi-tool, URL VA, document, image, WhiteBox, GreyBox, specialist, dashboard OK", flush=True)
                     context.close()
                 browser.close()
             for path in temp.glob('*.sqlite3*'):
-                raw = path.read_bytes()
+                try:
+                    raw = path.read_bytes()
+                except FileNotFoundError:
+                    # SQLite may remove its temporary WAL/SHM between glob and read.
+                    continue
                 assert all(value.encode() not in raw for value in tokens), path.name
         finally:
             server.should_exit = True

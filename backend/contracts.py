@@ -14,7 +14,7 @@ class ChatPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     prompt: str = Field(min_length=1, max_length=6000)
     target: Target = "reasoning"
-    history: list[HistoryMessage] = Field(default_factory=list, max_length=12)
+    history: list[HistoryMessage] = Field(default_factory=list, max_length=100)
     attachment_ids: list[str] = Field(default_factory=list, max_length=4)
     session_id: str = Field(default="default", min_length=1, max_length=100)
     web_mode: Literal["auto", "on", "off"] = "off"

@@ -229,8 +229,8 @@ async def clear_usage():
 def parse_history(value):
     try:
         parsed = TypeAdapter(list[HistoryMessage]).validate_json(value)
-        if len(parsed) > 12:
-            raise ValueError("Riwayat maksimal 12 pesan.")
+        if len(parsed) > 100:
+            raise ValueError("Riwayat maksimal 100 pesan.")
         return parsed
     except ValidationError as exc:
         raise ValueError("Format riwayat tidak valid.") from exc
@@ -258,7 +258,7 @@ class ChatUploadProposal(BaseModel):
     size: int = Field(ge=1, le=MAX_UPLOAD, strict=True)
     sha256: str = Field(pattern=r'^[a-f0-9]{64}$')
     prompt: str = Field(min_length=1, max_length=6000)
-    history: list[HistoryMessage] = Field(default_factory=list, max_length=12)
+    history: list[HistoryMessage] = Field(default_factory=list, max_length=100)
     model_override: str | None = Field(default=None, min_length=1, max_length=120, pattern=r'^[\w.\-/:]+$')
 
 
@@ -399,8 +399,8 @@ async def chat_endpoint(payload: ChatPayload, request: Request):
                     action = await asyncio.to_thread(request.app.state.store.propose_chat_action, payload.session_id, {
                         "intent": "coding", "target": "Workspace lokal", "tools": ["Coding Agent", "read_file", "list_dir", "propose_write"],
                         "duration": "Hingga batas waktu model", "summary": "Agen akan membaca workspace dan dapat mengusulkan diff. Penerapan diff memerlukan persetujuan terpisah.",
-                        "prompt": payload.prompt, "model_override": payload.model_override})
-                    yield wire(event("action_proposal", action={k: v for k, v in action.items() if k not in ("prompt", "model_override")}))
+                        "prompt": payload.prompt, "history": [h.model_dump() for h in payload.history], "model_override": payload.model_override})
+                    yield wire(event("action_proposal", action={k: v for k, v in action.items() if k not in ("prompt", "history", "model_override")}))
                     yield wire(event("done"))
                     return
                 if intent == "security" and not payload.model_override:
@@ -419,6 +419,10 @@ async def chat_endpoint(payload: ChatPayload, request: Request):
                     project_id = str(payload.project_id or uuid4())
                     plans = plan.get("jobs") or [plan]
                     disclosures = []
+                    if plan.get('url_va_profile'):
+                        disclosures.append('Paket VA URL dasar: HEAD untuk header' +
+                                           (' dan satu GET untuk inventaris HTML tanpa login atau menjalankan JavaScript.' if any(item['tool'] == 'inventory-html' for item in plans) else '.') +
+                                           ' Kandidat tautan tidak diakses; tidak ada scan port, subdomain, atau uji eksploitasi. Ini bukan asesmen kerentanan menyeluruh.')
                     if any(item['tool'] in ('subfinder-passive', 'amass-passive') for item in plans):
                         disclosures.append('Domain akan dikirim ke crt.sh.')
                     if any(item['tool'] == 'active-reflection' for item in plans):
@@ -540,7 +544,8 @@ async def confirm_chat_action(action_id: str, payload: ChatActionDecision, reque
             if action["intent"] == "coding":
                 yield wire(event("status", step="coding", label="Coding Agent sedang memeriksa workspace"))
                 result = await execute_agent_pipeline(action["prompt"], store=request.app.state.store,
-                                                  session_id=payload.session_id, model_override=action.get("model_override"))
+                                                  session_id=payload.session_id, model_override=action.get("model_override"),
+                                                  history=action.get("history", []))
                 await asyncio.to_thread(request.app.state.store.authorize_code_proposals, payload.session_id, action_id,
                                         [item['id'] for item in result.get('proposals', [])])
                 yield wire(event("result", result=result["result"], proposals=result.get("proposals", [])))

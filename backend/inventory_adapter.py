@@ -17,6 +17,7 @@ class Links(HTMLParser):
             if not value or not ((tag in ('a','link') and name=='href') or (tag=='script' and name=='src') or (tag=='form' and name=='action')):continue
             try:
                 parsed=urlsplit(urljoin(self.base,value))
+                parsed.port  # Raises ValueError for an invalid port so it is never recorded.
                 if parsed.scheme not in ('http','https') or not parsed.hostname or parsed.username or parsed.password:continue
                 # Paths and queries can carry credentials or personal data; record origins only.
                 clean=urlunsplit((parsed.scheme,parsed.netloc,'/', '', ''))

@@ -22,9 +22,117 @@ claims were dropped instead of silently presenting them as facts.
 """
 import json
 import re
+from urllib.parse import urlsplit
+
+from evidence_report import baseline
 
 # Bump when the checks change; stored reports from older versions are re-checked when read.
-GROUNDING_VERSION = 2
+GROUNDING_VERSION = 5
+
+# Adapter caps (inventory_adapter.Links, js_inventory_adapter): a full list may be truncated.
+INVENTORY_LIMITS = {'inventory-html': 40, 'js-bundle-inventory': 30}
+CANDIDATE_TERMS = re.compile(r'\b(?:kandidat|candidates?|origins?|asal|urls?|tautan|links?|situs|domains?|hosts?)\b', re.I)
+ORIGIN_CLASSES = re.compile(r'\b(?:eksternal|internal|external|same[- ]origin|cross[- ]origin|seasal|pihak ketiga|third[- ]party)\b', re.I)
+NUMBER_WORDS = re.compile(r'\b(?:\d+|nol|satu|dua|tiga|empat|lima|enam|tujuh|delapan|sembilan|sepuluh|zero|one|two|three|four|five|six|seven|eight|nine|ten)\b', re.I)
+CORS_TERMS = re.compile(r'\bcors\b|access-control|\bpreflight\b|origin header|header origin', re.I)
+
+
+def _origin(url):
+    try:
+        parsed = urlsplit(str(url))
+        scheme = parsed.scheme.lower()
+        if scheme not in ('http', 'https') or not parsed.hostname or parsed.username or parsed.password:
+            return None
+        return (scheme, parsed.hostname.lower().rstrip('.'), parsed.port or (443 if scheme == 'https' else 80))
+    except (TypeError, ValueError):
+        return None
+
+
+def inventory_origin_counts(source):
+    """Count distinct origins recorded by an inventory adapter, relative to the scanned URL.
+
+    ``external`` means a different host. A candidate on the target host with a
+    different scheme or port is a different origin but not an external site, so it
+    is counted separately instead of inflating the external count.
+    """
+    result = source.get('result') or {}
+    tool = result.get('tool')
+    if tool == 'inventory-html':
+        candidates = result.get('candidates')
+        urls = [item.get('url') if isinstance(item, dict) else None for item in candidates] if isinstance(candidates, list) else None
+    elif tool == 'js-bundle-inventory':
+        urls = result.get('candidate_origins')
+    else:
+        return None
+    if not isinstance(urls, list):
+        return None
+    target = _origin(result.get('target') or (source.get('target') or {}).get('value'))
+    if not target:
+        return None
+    origins = set()
+    for url in urls:
+        value = _origin(url)
+        if value is None:
+            return None  # Do not invent a count when any recorded candidate is malformed.
+        origins.add(value)
+    same = sum(value == target for value in origins)
+    external = sum(value[1] != target[1] for value in origins)
+    return {'total': len(origins), 'same_origin': same, 'same_host_other_origin': len(origins) - same - external,
+            'external': external, 'external_hosts': len({value[1] for value in origins if value[1] != target[1]}),
+            'recorded': len(urls), 'truncated': len(urls) >= INVENTORY_LIMITS[tool]}
+
+
+def origin_count_claim(sentence, source):
+    """Do not trust model-authored counts or classifications of candidate origins.
+
+    For inventory tools the counts are rendered from evidence instead. Other tools
+    (HEAD, ZAP, ...) never record candidate origins, so a model sentence that
+    classifies origins as external/third-party is unsupported; CORS statements
+    are left to the structured fact checks.
+    """
+    tool = (source.get('result') or {}).get('tool')
+    if not CANDIDATE_TERMS.search(sentence):
+        return False
+    if tool in INVENTORY_LIMITS:
+        return bool(ORIGIN_CLASSES.search(sentence) or NUMBER_WORDS.search(sentence))
+    return bool(ORIGIN_CLASSES.search(sentence)) and not CORS_TERMS.search(sentence)
+
+
+inventory_count_claim = origin_count_claim  # Backwards-compatible name.
+
+
+def inventory_count_line(source):
+    counts = inventory_origin_counts(source)
+    if counts is None:
+        return None
+    label = 'Evidence inventaris' if (source.get('result') or {}).get('tool') == 'inventory-html' else 'Evidence bundle JS'
+    line = (f"{label} mencatat {counts['total']} origin kandidat unik: {counts['same_origin']} sama dengan origin target, "
+            + (f"{counts['same_host_other_origin']} pada host target dengan skema/port berbeda, " if counts['same_host_other_origin'] else '')
+            + f"dan {counts['external']} origin eksternal (di {counts['external_hosts']} host selain host target).")
+    if counts['truncated']:
+        line += f" Daftar kandidat dibatasi {counts['recorded']} entri oleh adapter; jumlah sebenarnya bisa lebih besar."
+    return line
+
+
+def inventory_report(source):
+    """Render inventory facts deterministically; model prose cannot change the counts."""
+    result = source.get('result') or {}
+    if result.get('tool') != 'inventory-html':
+        return None
+    status = result.get('http_status')
+    summary = f'Inventaris HTML menghasilkan HTTP {status}.' if isinstance(status, int) and 100 <= status <= 599 else 'Hasil inventaris HTML tersedia.'
+    count_line = inventory_count_line(source)
+    summary += ' ' + (count_line or 'Jumlah origin tidak dapat dihitung dari evidence yang tersedia.')
+    observations = [count_line] if count_line else ['Jumlah origin memerlukan pemeriksaan manual.']
+    if isinstance(status, int) and 100 <= status <= 599:
+        observations.insert(0, f'Status HTTP: {status}.')
+    candidates = result.get('candidates')
+    if isinstance(candidates, list) and all(isinstance(row, dict) and row.get('contacted') is False for row in candidates):
+        observations.append('Origin kandidat yang tercatat tidak dihubungi oleh inventaris.')
+    return {'summary':summary, 'observations':observations,
+            'limitations':['Satu GET HTML tanpa sesi; kandidat tidak otomatis menjadi target pengujian.',
+                           'JavaScript tidak dijalankan atau dibaca; hasil memerlukan review manusia.'],
+            'recommendations':[]}
 
 # concept -> (pattern that detects the concept in model text, evidence terms that support it)
 CONCEPTS = {
@@ -298,6 +406,8 @@ class Grounder:
 
     def check(self, sentence, facts=True):
         missing = unsupported_terms(sentence, self.evidence) + (fact_conflicts(sentence, self.facts) if facts else [])
+        if origin_count_claim(sentence, self.source):
+            missing.append('jumlah atau klasifikasi origin kandidat dihitung dari evidence')
         if missing:
             self.removed += 1
             self.terms.extend(missing)
@@ -342,20 +452,40 @@ def reviewed_report(payload):
     returned view and the report is marked so it is not mistaken for one that passed the current checks."""
     if payload.get('grounding_version') == GROUNDING_VERSION:
         return {**payload, 'grounding_status': 'current'}
-    facts = structured_facts(payload.get('source') or {})
+    source = payload.get('source') or {}
+    inventory = inventory_report(source)
+    if inventory is not None:
+        inventory['limitations'].insert(0, f'Laporan lama ditampilkan ulang dari evidence dengan grounding v{GROUNDING_VERSION}; data tersimpan tidak diubah.')
+        return {**payload, 'grounding_status':'legacy_rechecked', 'output':inventory}
+    facts = structured_facts(source)
     output = payload.get('output') or {}
     removed = 0
 
     def keep(line):
         nonlocal removed
         statement = re.sub(r'\s*\(bukti: “.*?”\)\s*$', '', str(line))
-        if any(fact_conflicts(sentence, facts) for sentence in split_sentences(statement)):
+        if any(fact_conflicts(sentence, facts) or origin_count_claim(sentence, source) for sentence in split_sentences(statement)):
             removed += 1
             return False
         return True
 
     summary = ' '.join(s for s in split_sentences(output.get('summary', '')) if keep(s))
+    base = baseline(source)
+    if base is not None:
+        merged = merge_baseline(base, summary, [line for line in output.get('observations') or [] if keep(line)],
+                                [line for line in output.get('limitations') or [] if keep(line)],
+                                [line for line in output.get('recommendations') or [] if keep(line)])
+        merged['limitations'].insert(0, f'Laporan lama ditampilkan ulang dengan fakta evidence (grounding v{GROUNDING_VERSION}); '
+                                        + (f'{removed} pernyataan model yang bertentangan disembunyikan; ' if removed else '')
+                                        + 'data tersimpan tidak diubah.')
+        merged['limitations'] = merged['limitations'][:8]
+        return {**payload, 'grounding_status': 'legacy_rechecked', 'legacy_statements_hidden': removed, 'output': merged}
+    count_line = inventory_count_line(source)
+    if count_line:
+        summary = (summary[:max(0, 1400 - len(count_line) - 1)].rstrip() + ' ' + count_line).strip()
     observations = [line for line in output.get('observations') or [] if keep(line)]
+    limitations = [line for line in output.get('limitations') or [] if keep(line)]
+    recommendations = [line for line in output.get('recommendations') or [] if keep(line)]
     note = (f'Laporan lama: dibuat sebelum validasi fakta terstruktur (grounding v{GROUNDING_VERSION}). '
             + (f'{removed} pernyataan yang bertentangan dengan evidence disembunyikan saat ditampilkan. ' if removed else '')
             + 'Jalankan ulang Deep Analysis untuk laporan yang lolos pemeriksaan terbaru.')
@@ -363,12 +493,57 @@ def reviewed_report(payload):
         **output,
         'summary': summary or 'Ringkasan laporan lama bertentangan dengan evidence dan disembunyikan; tinjau evidence asli.',
         'observations': observations or ['Observasi laporan lama disembunyikan karena bertentangan dengan evidence.'],
-        'limitations': [note, *(output.get('limitations') or [])],
+        'limitations': [note, *limitations], 'recommendations': recommendations,
     }}
+
+
+def grounding_notes(grounder):
+    notes = ['Pernyataan model telah dicocokkan dengan evidence tersensor, tetapi bukan bukti kerentanan; '
+             'penilaian risiko memerlukan review manusia.']
+    if grounder.removed:
+        terms = ', '.join(dict.fromkeys(grounder.terms)) or 'kutipan yang tidak cocok'
+        notes.append(f'{grounder.removed} pernyataan model dihapus karena merujuk hal yang tidak ada di evidence ({terms[:300]}).')
+    return notes
+
+
+BASELINE_SUBJECTS = re.compile(r'\bheaders?\b|\bports?\b|\bcookies?\b|\bredirect|\bpengalihan\b|\bstatus http\b', re.I)
+
+
+def merge_baseline(base, summary, observations, limitations, recommendations):
+    """Evidence facts first; grounded model lines only add what the facts do not already state.
+
+    Model observations and limitations that name a structured fact (CSP, HSTS, cookie flags, ...)
+    are dropped because the fact lines state it from evidence; this also stops facts from being
+    reported under the wrong heading.
+    """
+    def restates_fact(line):
+        # General claims ("semua header tersedia", "port terbuka") are covered by the fact lines too.
+        return bool(BASELINE_SUBJECTS.search(str(line))) or any(re.search(pattern, str(line), re.I) for pattern in FACT_PATTERNS.values())
+
+    def unique(lines, limit):
+        seen, kept = set(), []
+        for line in lines:
+            key = normalize(str(line))
+            if key and key not in seen:
+                seen.add(key)
+                kept.append(str(line)[:500])
+        return kept[:limit]
+
+    narrative = ' '.join(sentence for sentence in split_sentences(summary) if not restates_fact(sentence))
+    return {
+        'summary': (base['summary'] + (' Catatan model: ' + narrative if narrative else ''))[:1400].strip()
+                   or 'Ringkasan disusun dari evidence; tinjau observasi di bawah.',
+        'observations': unique([*base['observations'], *(line for line in observations if not restates_fact(line))], 12),
+        'limitations': unique([*base['limitations'], *(line for line in limitations if not restates_fact(line))], 6),
+        'recommendations': unique([*base['recommendations'], *recommendations], 8),
+    }
 
 
 def grounded_output(candidate, source):
     """Keep only model statements that are consistent with the recorded evidence."""
+    inventory = inventory_report(source)
+    if inventory is not None:
+        return inventory
     grounder = Grounder(source)
     observations = []
     for item in candidate.get('observations', []) or []:
@@ -379,16 +554,20 @@ def grounded_output(candidate, source):
     limitations = grounder.items(candidate.get('limitations'), limit=6)
     # Recommendations are prescriptive ("Terapkan CSP yang ketat"), so only anchors are checked.
     recommendations = grounder.items(candidate.get('recommendations'), facts=False)
+    base = baseline(source)
+    if base is not None:
+        merged = merge_baseline(base, summary, observations, limitations, recommendations)
+        merged['limitations'] = (merged['limitations'] + grounding_notes(grounder))[:8]
+        return merged
     if not summary:
         summary = (f"Ringkasan model untuk evidence {source['evidence_id']} tidak dapat diverifikasi terhadap evidence; "
                    'gunakan observasi dan evidence asli sebagai acuan.')
+    count_line = inventory_count_line(source)
+    if count_line:
+        summary = (summary[:max(0, 1400 - len(count_line) - 1)].rstrip() + ' ' + count_line).strip()
     if not observations:
         observations = ['Tidak ada observasi model yang dapat dicocokkan dengan evidence; tinjau evidence secara manual.']
-    limitations.append('Pernyataan model telah dicocokkan dengan evidence tersensor, tetapi bukan bukti kerentanan; '
-                       'penilaian risiko memerlukan review manusia.')
-    if grounder.removed:
-        terms = ', '.join(dict.fromkeys(grounder.terms)) or 'kutipan yang tidak cocok'
-        limitations.append(f'{grounder.removed} pernyataan model dihapus karena merujuk hal yang tidak ada di evidence ({terms[:300]}).')
+    limitations.extend(grounding_notes(grounder))
     return {
         'summary': summary[:1400],
         'observations': observations[:8],
