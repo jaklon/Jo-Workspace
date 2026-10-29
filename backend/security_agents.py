@@ -22,6 +22,7 @@ from security_evidence import RedactionInput, EvidenceInput, redactor
 from security_orchestration import RunDecision, installed_models
 from security_agent_lab import PROFILES, VERSION, catalog as profiles, lab_descriptor, observations
 from security_policy import evaluate
+from analysis_grounding import reviewed_report
 
 Role = Literal['recon','web_api','auth_bola','llm_security','reporting']
 
@@ -499,7 +500,7 @@ def init_evidence_specialists(store):
 
 async def analyze_evidence_specialist(state, project, engagement, body, role):
     """Review already-recorded evidence; never invoke target tools or synthetic lab."""
-    from deep_analysis import MODEL_SCHEMA, GROUNDING_RULES, parse_model_output, check_mode, checked_source, model_context, grounded_output
+    from deep_analysis import MODEL_SCHEMA, GROUNDING_RULES, GROUNDING_VERSION, parse_model_output, check_mode, checked_source, model_context, grounded_output
     if role not in PROFILES or not body.acknowledge:
         raise HTTPException(422, 'Peran dan persetujuan analisis wajib valid.')
     job_id = str(body.job_id)
@@ -532,7 +533,7 @@ async def analyze_evidence_specialist(state, project, engagement, body, role):
                'job_id': job_id, 'role': role, 'created_at': utc_now().isoformat(),
                'model': body.model, 'model_digest': selected['digest'], 'source': source,
                'context_note': context_note, 'output': output, 'status': 'needs_human_review',
-               'execution': 'evidence_review_only'}
+               'execution': 'evidence_review_only', 'grounding_version': GROUNDING_VERSION}
     with state.engagements.transaction() as db:
         check_mode(state, db, project, engagement, body)
         if checked_source(state, db, project, engagement, job_id, evidence_id) != source:
@@ -554,7 +555,7 @@ async def list_evidence_specialists(project_id: UUID, engagement_id: UUID, reque
             payload = json.loads(row['payload'])
             if digest(payload) != row['payload_hash']:
                 raise HTTPException(409, 'Integritas analisis spesialis tidak sesuai.')
-            items.append(payload)
+            items.append(reviewed_report(payload))
     return {'items': items}
 
 

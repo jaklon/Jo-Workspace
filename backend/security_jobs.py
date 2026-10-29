@@ -374,7 +374,17 @@ class JobStore:
         with self.engagements.transaction() as db:
             if not self.owned(db, owner) or db.execute("SELECT COUNT(*) FROM security_jobs WHERE status='running'").fetchone()[0]:
                 return None
-            row = db.execute("SELECT * FROM security_jobs WHERE status='queued' ORDER BY created_at,id LIMIT 1").fetchone()
+            row = None
+            for queued in db.execute("SELECT * FROM security_jobs WHERE status='queued' ORDER BY created_at,id").fetchall():
+                if (json.loads(queued["plan"]).get("scan") or {}).get("tool") != "auth-two-session":
+                    row = row or queued
+                elif self.sessions.alive(queued["id"]):
+                    # Test sessions expire after a short TTL, so they run before older queued jobs.
+                    row = queued
+                    break
+                else:
+                    self.finish(db, queued, "failed", "SESSION_EXPIRED",
+                                "Sesi uji kedaluwarsa sebelum job dimulai. Token tidak dipakai; buat run baru dengan token baru.")
             if row is None:
                 return None
             now = self.clock().isoformat()

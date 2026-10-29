@@ -115,7 +115,7 @@ def parse_model_output(content):
         return AnalysisOutput.model_validate_json(content).model_dump(mode='json')
 
 
-from analysis_grounding import grounded_output  # noqa: E402  (re-exported for security_agents)
+from analysis_grounding import GROUNDING_VERSION, grounded_output, reviewed_report  # noqa: E402  (re-exported for security_agents)
 
 
 def model_context(source):
@@ -269,6 +269,7 @@ def chat_report(state, project_id, prompt):
     else:selected=[found[0]]
     sections=[]
     for report in selected:
+        report=reviewed_report(report)
         output=report['output']
         tool=report['source']['result'].get('tool','HEAD')
         sections.extend([f"Deep Analisis {MODES[report.get('assessment_mode','blackbox')]['label']} · {tool} · {target}",output['summary']])
@@ -343,7 +344,7 @@ async def list_analyses(project_id: UUID, engagement_id: UUID, request: Request)
             payload = json.loads(row['payload'])
             if digest(payload) != row['payload_hash']:
                 raise HTTPException(409, 'Integritas analisis tidak sesuai.')
-            items.append(payload)
+            items.append(reviewed_report(payload))
     return {'items': items}
 
 
@@ -402,7 +403,7 @@ async def analyze(project_id: UUID, engagement_id: UUID, body: AnalysisRequest, 
                'test_account_ref':scrub(body.test_account_ref),
                'engagement_id': engagement, 'actor': scrub(body.actor_label), 'model': body.model,
                'model_digest': selected['digest'], 'source': source, 'output': output,
-               'context_note':context_note,
+               'context_note':context_note, 'grounding_version': GROUNDING_VERSION,
                'status': 'needs_human_review', 'tool_execution': 'operator_declared_import' if imported else ('approved_tcp_scan' if tool in ('tcp-connect','nmap') else 'approved_tool_run' if tool else 'approved_public_head_only')}
     with state.engagements.transaction() as db:
         check_mode(state, db, project, engagement, body)

@@ -11,6 +11,7 @@ type Report = {
   model: string
   assessment_mode?: 'blackbox' | 'whitebox' | 'greybox'
   context_note?: string
+  grounding_status?: 'current' | 'legacy_rechecked'
   source: { evidence_id: string; target: { value: string }; artifact_hash: string; result: { kind?: string } }
   output: { summary: string; observations: string[]; limitations: string[]; recommendations: string[] }
 }
@@ -116,6 +117,7 @@ export function DeepAnalysis({ engagement }: { engagement: Engagement }): JSX.El
     {reports.map((report) => <article className="security-card" key={report.id}>
       <h4>{modes[report.assessment_mode || 'blackbox'].label} · {report.source.target.value}</h4>
       <p>{report.created_at} · {report.model} · perlu review manusia</p>
+      {report.grounding_status === 'legacy_rechecked' && <p role="note" className="notice error">Laporan lama: belum lolos validasi fakta terstruktur terbaru. Pernyataan yang bertentangan dengan evidence disembunyikan; jalankan ulang analisis.</p>}
       {report.context_note && <p>{report.context_note}</p>}
       <p>{report.source.result.kind === 'operator_import' ? 'Impor deklarasi operator; pelaksanaan tool tidak diverifikasi.' : 'Hasil adapter pemeriksaan yang disetujui.'}</p>
       <p>Evidence: {report.source.evidence_id} · SHA-256: {report.source.artifact_hash}</p>

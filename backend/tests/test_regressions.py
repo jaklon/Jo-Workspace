@@ -129,6 +129,20 @@ class DocumentTests(unittest.TestCase):
         self.assertEqual("".join(text for kind, text in parts if kind == "token"), "Halo  dunia")
         self.assertEqual("".join(text for kind, text in parts if kind == "thinking"), "rahasia")
 
+    def test_streamed_answer_matches_clean_answer_for_every_chunk_split(self):
+        cases = ["<analysis>rahasia</analysis>Jawaban", "<think>rahasia</think>Jawaban <ANALYSIS>rahasia</ANALYSIS> akhir",
+                 "Thinking Process: rahasia\nFinal Answer: Aman", "Analysis: rahasia saja",
+                 "  analysis: rahasia\nJawaban akhir: Siap", "Analisis singkat: tetap jawaban", "OK", "a <b>tebal</b> <thin"]
+        for text in cases:
+            for size in range(1, len(text) + 1):
+                splitter = ThinkSplitter()
+                parts = [part for i in range(0, len(text), size) for part in splitter.feed(text[i:i + size])]
+                parts += splitter.flush()
+                answer = "".join(t for kind, t in parts if kind == "token")
+                with self.subTest(text=text, size=size):
+                    self.assertEqual(answer.strip(), clean_answer(text))
+                    self.assertNotIn("rahasia", answer)
+
     def test_image_dispatch_is_explicit(self):
         self.assertEqual(detect_pipeline_route("x.jpeg", "describe"), "VISION_PIPELINE")
         with self.assertRaises(ValueError):

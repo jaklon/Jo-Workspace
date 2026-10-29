@@ -35,31 +35,54 @@ def clean_answer(text):
 
 
 class ThinkSplitter:
-    """Route streamed <think>…</think> spans to reasoning and the rest to the answer.
+    """Route streamed reasoning to `thinking` and the rest to the answer, matching clean_answer.
 
-    Tags may arrive split across chunks, so a possible partial tag is held back."""
+    Handles <think>…</think> and <analysis>…</analysis> spans, and untagged answers that open with
+    "Thinking Process"/"Analysis:" and continue until "Final Answer:"/"Jawaban akhir:". Markers may
+    arrive split across chunks, so a possible partial marker is held back."""
+
+    OPEN = {"<think>": "</think>", "<analysis>": "</analysis>"}
+    UNTAGGED = ("thinking process", "analysis:")
+    FINAL = ("final answer:", "jawaban akhir:")
 
     def __init__(self):
-        self.inside = False
+        self.closing = None  # markers that end the current reasoning span, or None outside one
+        self.started = False
         self.buffer = ""
 
     def feed(self, text):
         self.buffer += text
         parts = []
+        if not self.started:
+            head = self.buffer.lstrip().lower()
+            if any(prefix.startswith(head) and len(head) < len(prefix) for prefix in self.UNTAGGED):
+                return parts  # could still become an untagged reasoning prefix
+            self.started = True
+            if head.startswith(self.UNTAGGED):
+                self.closing = self.FINAL
         while self.buffer:
-            tag = "</think>" if self.inside else "<think>"
-            index = self.buffer.lower().find(tag)
-            if index < 0:
-                keep = next((n for n in range(len(tag) - 1, 0, -1) if self.buffer.lower().endswith(tag[:n])), 0)
+            lower = self.buffer.lower()
+            markers = self.closing or tuple(self.OPEN)
+            hits = [(lower.find(marker), marker) for marker in markers if marker in lower]
+            if not hits:
+                keep = max((n for marker in markers for n in range(len(marker) - 1, 0, -1)
+                            if lower.endswith(marker[:n])), default=0)
                 self._emit(parts, self.buffer[:len(self.buffer) - keep])
                 self.buffer = self.buffer[len(self.buffer) - keep:]
                 break
+            index, marker = min(hits)
             self._emit(parts, self.buffer[:index])
-            self.buffer = self.buffer[index + len(tag):]
-            self.inside = not self.inside
+            self.buffer = self.buffer[index + len(marker):]
+            if self.closing:
+                self.closing = None
+                if marker in self.FINAL:
+                    self.buffer = self.buffer.lstrip()
+            else:
+                self.closing = (self.OPEN[marker],)
         return parts
 
     def flush(self):
+        self.started = True
         parts = []
         self._emit(parts, self.buffer)
         self.buffer = ""
@@ -67,7 +90,7 @@ class ThinkSplitter:
 
     def _emit(self, parts, text):
         if text:
-            parts.append(("thinking" if self.inside else "token", text))
+            parts.append(("thinking" if self.closing else "token", text))
 
 
 def bounded_messages(system, prompt, history=(), context="", tools=None, thinking=False):
