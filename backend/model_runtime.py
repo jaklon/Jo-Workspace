@@ -118,6 +118,8 @@ class ModelRuntime:
         self.completed = 0
         self.failed = 0
         self.last_metrics = {}
+        self.current = None
+        self.last_failure = None
         self.usage = UsageLedger(config.DATA_DIR / "usage.json")
 
     @asynccontextmanager
@@ -142,9 +144,15 @@ class ModelRuntime:
     async def chunks(self, model, messages, **kwargs):
         start = time.perf_counter()
         recorded = False
+        request = None
         try:
             async with aclosing(self._chunks(model, messages, **kwargs)) as stream:
                 async for chunk in stream:
+                    if chunk.get("status") == "running":
+                        # Exposed by /api/runtime/status so a slow request can be explained.
+                        request = {"model": model, "started": time.time(), "thinking": bool(kwargs.get("think")),
+                                   "images": bool(kwargs.get("images"))}
+                        self.current = request
                     if chunk.get("done"):
                         recorded = True
                         self.usage.record(model, "completed", time.perf_counter() - start, chunk)
@@ -153,11 +161,16 @@ class ModelRuntime:
             if not recorded:
                 self.usage.record(model, "cancelled", time.perf_counter() - start)
             raise
-        except Exception:
+        except Exception as exc:
             if not recorded:
                 self.failed += 1
                 self.usage.record(model, "failed", time.perf_counter() - start)
+                self.last_failure = {"model": model, "at": time.time(), "type": type(exc).__name__,
+                                     "detail": str(exc)[:300]}
             raise
+        finally:
+            if request is not None and self.current is request:
+                self.current = None
 
     async def _chunks(self, model, messages, *, tools=None, images=None, output_tokens=None, format_schema=None,
                       local_only=False, think=False):
@@ -205,7 +218,10 @@ class ModelRuntime:
                                 self.completed += 1
                                 self.last_metrics = {"model": model, "seconds": round(time.perf_counter()-start,3),
                                     "output_tokens": chunk.get("eval_count"), "input_tokens": chunk.get("prompt_eval_count"),
-                                    "done_reason": chunk.get("done_reason")}
+                                    "done_reason": chunk.get("done_reason"), "thinking": thinking,
+                                    "load_seconds": round((chunk.get("load_duration") or 0) / 1e9, 1),
+                                    "tokens_per_second": round(chunk["eval_count"] / (chunk["eval_duration"] / 1e9), 1)
+                                        if chunk.get("eval_count") and chunk.get("eval_duration") else None}
                                 logger.info("inference %s", json.dumps(self.last_metrics))
                             yield chunk
                             if done:

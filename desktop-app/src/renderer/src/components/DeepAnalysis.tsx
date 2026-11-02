@@ -23,6 +23,33 @@ const modes = {
 }
 const kindLabels: Record<string, string> = { external_observation: 'Observasi eksternal', source_code: 'Kode sumber', configuration: 'Konfigurasi', api_documentation: 'Dokumentasi API', authenticated_observation: 'Observasi akun uji', monitoring: 'Monitoring / log' }
 
+type AnalysisData = { jobs: SecurityJob[]; evidence: Evidence[]; reports: Report[]; tools: ToolStatus[]; models: { name: string }[]; modelsAvailable: boolean }
+
+async function fetchAnalysis(base: string): Promise<AnalysisData> {
+  const [j, a, records, capabilities] = await Promise.all([
+    apiFetch(`${base}/jobs`).then((r) => r.json()),
+    apiFetch(`${base}/deep-analysis`).then((r) => r.json()),
+    apiFetch(`${base}/records`).then((r) => r.json()) as Promise<RecordsListing>,
+    apiFetch(`${base}/deep-analysis/capabilities`).then((r) => r.json())
+  ])
+  let models: { name: string }[] = []
+  let modelsAvailable = true
+  try {
+    const m = await apiFetch('/api/security/orchestration/catalog').then((r) => r.json())
+    models = m.models as { name: string }[]
+  } catch {
+    modelsAvailable = false
+  }
+  return {
+    jobs: (j.items as SecurityJob[]).filter((item) => item.status === 'completed'),
+    evidence: records.evidence.filter((item) => item.provenance === 'operator_declared_import'),
+    reports: a.items as Report[],
+    tools: capabilities.tools as ToolStatus[],
+    models,
+    modelsAvailable
+  }
+}
+
 export function DeepAnalysis({ engagement }: { engagement: Engagement }): JSX.Element {
   const base = `/api/security/projects/${engagement.project_id}/engagements/${engagement.id}`
   const [jobs, setJobs] = useState<SecurityJob[]>([])
@@ -41,26 +68,16 @@ export function DeepAnalysis({ engagement }: { engagement: Engagement }): JSX.El
   const [kind, setKind] = useState('external_observation')
   const [account, setAccount] = useState('')
 
-  const load = async (): Promise<void> => {
-    const [j, a, records, capabilities] = await Promise.all([
-      apiFetch(`${base}/jobs`).then((r) => r.json()),
-      apiFetch(`${base}/deep-analysis`).then((r) => r.json()),
-      apiFetch(`${base}/records`).then((r) => r.json()) as Promise<RecordsListing>,
-      apiFetch(`${base}/deep-analysis/capabilities`).then((r) => r.json())
-    ])
-    setJobs((j.items as SecurityJob[]).filter((item) => item.status === 'completed'))
-    setEvidence(records.evidence.filter((item) => item.provenance === 'operator_declared_import'))
-    setReports(a.items as Report[])
-    setTools(capabilities.tools as ToolStatus[])
-    try {
-      const m = await apiFetch('/api/security/orchestration/catalog').then((r) => r.json())
-      setModels(m.models as { name: string }[])
-    } catch {
-      setModels([])
-      setError('Model lokal tidak tersedia. Riwayat tetap dapat dibaca; jalankan Ollama untuk analisis baru.')
-    }
+  const apply = (data: AnalysisData): void => {
+    setJobs(data.jobs)
+    setEvidence(data.evidence)
+    setReports(data.reports)
+    setTools(data.tools)
+    setModels(data.models)
+    if (!data.modelsAvailable) setError('Model lokal tidak tersedia. Riwayat tetap dapat dibaca; jalankan Ollama untuk analisis baru.')
   }
-  useEffect(() => { void load().catch((e) => setError(String(e))) }, [base])
+  const load = async (): Promise<void> => apply(await fetchAnalysis(base))
+  useEffect(() => { void fetchAnalysis(base).then(apply).catch((e) => setError(String(e))) }, [base])
   const run = async (): Promise<void> => {
     setBusy(true); setError('')
     try {

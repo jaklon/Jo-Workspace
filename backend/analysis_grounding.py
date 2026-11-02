@@ -27,7 +27,7 @@ from urllib.parse import urlsplit
 from evidence_report import baseline
 
 # Bump when the checks change; stored reports from older versions are re-checked when read.
-GROUNDING_VERSION = 5
+GROUNDING_VERSION = 6
 
 # Adapter caps (inventory_adapter.Links, js_inventory_adapter): a full list may be truncated.
 INVENTORY_LIMITS = {'inventory-html': 40, 'js-bundle-inventory': 30}

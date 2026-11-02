@@ -38,11 +38,22 @@ WEB_CUES = re.compile(
 IMAGE_CUES = re.compile(r'\b(gambar|foto|image|picture|ilustrasi|photos?)\b', re.I)
 DEEP_CUES = re.compile(r'\b(analisis|mendalam|rinci|detail|tabel|isi halaman|berdasarkan halaman|full text|complete)\b', re.I)
 DIRECT_CUES = re.compile(r'^\s*(hai|halo|hello|terima kasih|thanks|tulis|buatkan|terjemahkan|hitung|jelaskan konsep)\b', re.I)
+USER_MARKER = "\n\nPesan pengguna:\n"
+
+
+def user_message(prompt):
+    """The user's own words without the client's preference, project-instruction and memory prefix.
+
+    Only this part may leave the device as search terms. The last marker wins, so a marker typed by
+    the user can only shorten the message, never expose the prefix."""
+    head, marker, tail = prompt.rpartition(USER_MARKER)
+    return tail.strip() if marker else prompt.strip()
 
 
 async def plan_web(prompt, mode, model):
     if mode == "off":
         return None
+    prompt = user_message(prompt)
     raw_urls = [value.rstrip('.,);]') for value in URL_RE.findall(prompt)]
     if raw_urls:
         safe = public_url(raw_urls[0])
@@ -186,7 +197,9 @@ async def web_context(prompt, mode, model, history=()):
                     "Sebagian tautan mungkin gagal dimuat; jangan menyatakan tidak ada gambar jika kandidat tersedia. "
                     "Jangan mengklaim telah melihat isi visual gambar hanya dari URL, judul, atau alt.\n\n") if plan['images'] else ''
     messages = bounded_messages(WEB_SYSTEM, prompt, history, image_notice + '\n\n'.join(context), thinking=True, facts=True)
-    return {'messages': messages, 'sources': sources, 'images': images[:8], 'coverage': None}
+    # What actually left the device for this answer, shown with the result.
+    outbound = {'query': plan['query'], 'pages': [row['url'] for row in rows if 'page_text' in row or row.get('fetch_error')]}
+    return {'messages': messages, 'sources': sources, 'images': images[:8], 'coverage': None, 'outbound': outbound}
 
 
 def linked_answer(answer, sources):

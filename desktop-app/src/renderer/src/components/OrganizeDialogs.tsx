@@ -1,7 +1,8 @@
 import { useState, type JSX } from 'react'
 import { Archive, Download, Pin, Trash2 } from 'lucide-react'
 import { Modal } from './Modal'
-import type { ChatSession, Project } from '../lib/types'
+import type { ChatSession, Project, ProjectFact } from '../lib/types'
+import { ProjectMemoryList } from './ProjectMemory'
 import { downloadFile } from '../lib/preferences'
 
 export function ProjectEditor({
@@ -11,12 +12,13 @@ export function ProjectEditor({
   onClose
 }: {
   project: Project | null
-  onSave: (name: string, instructions: string) => void
+  onSave: (name: string, instructions: string, memory: ProjectFact[]) => void
   onDelete: () => Promise<void>
   onClose: () => void
 }): JSX.Element {
   const [name, setName] = useState(project?.name || '')
   const [instructions, setInstructions] = useState(project?.instructions || '')
+  const [memory, setMemory] = useState<ProjectFact[]>(project?.memory || [])
   const [confirm, setConfirm] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -31,7 +33,7 @@ export function ProjectEditor({
         className="organize-form"
         onSubmit={(e) => {
           e.preventDefault()
-          if (name.trim()) onSave(name.trim(), instructions.trim())
+          if (name.trim()) onSave(name.trim(), instructions.trim(), memory)
         }}
       >
         <p className="muted-text">
@@ -59,9 +61,10 @@ export function ProjectEditor({
           />
           <small>{instructions.length}/1500 karakter · Dikirim bersama pesan di project ini.</small>
         </label>
+        <ProjectMemoryList memory={memory} onChange={setMemory} />
         <p className="muted-text">
           Project mengelompokkan chat. Riwayat dan lampiran antarpercakapan tidak dibagikan
-          otomatis.
+          otomatis; hanya instruksi dan memori project di atas yang ikut dikirim.
         </p>
         <div className="settings-form-actions">
           {project && (

@@ -5,6 +5,7 @@ import { engagementPath, type Engagement, type ScopeKind } from '../lib/engageme
 import type { JobsListing, SecurityJob } from '../lib/securityJobs'
 import { downloadFile } from '../lib/preferences'
 import { Modal } from './Modal'
+import { ReportSummary } from './ReportSummary'
 import {
   sourceLabels,
   findingLabels,
@@ -528,9 +529,25 @@ export function SecurityRecords({
                 findings · RoE v{report.snapshot.roe_version}
               </p>
               <p className="record-hash">SHA-256 snapshot: {report.hash}</p>
+              {report.view && <ReportSummary view={report.view} />}
               <div className="roe-decision-actions">
+                {report.readable_markdown && (
+                  <button
+                    className="primary-button"
+                    onClick={() =>
+                      downloadFile(
+                        'laporan-' + report.snapshot.id + '.md',
+                        report.readable_markdown ?? '',
+                        'text/markdown'
+                      )
+                    }
+                  >
+                    <Download size={14} />
+                    Unduh laporan (mudah dibaca)
+                  </button>
+                )}
                 <button
-                  className="primary-button"
+                  className={report.readable_markdown ? 'secondary-button' : 'primary-button'}
                   onClick={() =>
                     downloadFile(
                       'report-' + report.snapshot.id + '.md',
@@ -540,7 +557,7 @@ export function SecurityRecords({
                   }
                 >
                   <Download size={14} />
-                  Unduh laporan Markdown
+                  Unduh snapshot teknis
                 </button>
                 <button
                   className="secondary-button"

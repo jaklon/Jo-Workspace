@@ -15,6 +15,7 @@ from pydantic import AwareDatetime, Field, StrictBool, model_validator, field_va
 from engagements import StrictModel, ScopeAsset, utc_now
 from security_jobs import encode, digest, TERMINAL
 import evidence_archive
+from security_report import readable_markdown, report_view
 
 MAX_EVIDENCE = 100
 MAX_FINDINGS = 100
@@ -460,7 +461,15 @@ class EvidenceStore:
             if not row: raise HTTPException(404,'Laporan tidak ditemukan pada engagement ini.')
             p = json.loads(row['payload'])
             if digest(p) != row['payload_hash']: raise HTTPException(409,'Integritas laporan tidak sesuai.')
-            return {'snapshot':p,'hash':row['payload_hash'],'markdown':report_markdown(p,row['payload_hash'])}
+            # The report created just before this one in the same engagement, for retest comparison.
+            prior = db.execute('SELECT payload,payload_hash FROM security_reports WHERE engagement_id=? AND '
+                               'rowid<(SELECT rowid FROM security_reports WHERE id=?) ORDER BY rowid DESC LIMIT 1',(eid,rid)).fetchone()
+            previous = json.loads(prior['payload']) if prior else None
+            if previous is not None and digest(previous) != prior['payload_hash']: raise HTTPException(409,'Integritas laporan sebelumnya tidak sesuai.')
+            technical = report_markdown(p,row['payload_hash'])
+            readable = readable_markdown(p,row['payload_hash'],previous)
+            return {'snapshot':p,'hash':row['payload_hash'],'markdown':technical,'view':report_view(p,previous),
+                    'readable_markdown':readable+'\n---\n\n## Lampiran teknis (snapshot lengkap)\n\n'+technical}
 
 
 def report_markdown(snapshot, report_hash):

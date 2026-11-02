@@ -3,6 +3,11 @@ import { apiFetch } from '../lib/api'
 import type { Engagement } from '../lib/engagements'
 import type { SecurityJob } from '../lib/securityJobs'
 
+async function fetchScanJobs(base: string): Promise<SecurityJob[]> {
+  const data = await (await apiFetch(base)).json()
+  return (data.items as SecurityJob[]).filter((item) => item.plan.scan)
+}
+
 export function TCPScan({ engagement }: { engagement: Engagement }): JSX.Element {
   const base = `/api/security/projects/${engagement.project_id}/engagements/${engagement.id}/jobs`
   const [ip, setIp] = useState('')
@@ -26,15 +31,15 @@ export function TCPScan({ engagement }: { engagement: Engagement }): JSX.Element
   const [job, setJob] = useState<SecurityJob | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  const load = async (): Promise<void> => {
-    const data = await (await apiFetch(base)).json()
-    setItems((data.items as SecurityJob[]).filter((item) => item.plan.scan))
-  }
+  // Temporary account tokens never outlive the job (or engagement) they were typed for.
+  const tokenScope = `${base}:${job?.id ?? ''}`
+  const [tokenOwner, setTokenOwner] = useState(tokenScope)
+  if (tokenOwner !== tokenScope) { setTokenOwner(tokenScope); setTokenA(''); setTokenB('') }
+  const load = async (): Promise<void> => setItems(await fetchScanJobs(base))
   useEffect(() => {
-    void load().catch((e) => setError(String(e)))
+    void fetchScanJobs(base).then(setItems).catch((e) => setError(String(e)))
     void apiFetch('/api/pentest/capabilities').then((r) => r.json()).then((data) => { setHash(data.nmap_binary_sha256 || ''); setNucleiHash(data.nuclei_binary_sha256 || ''); setZapHash(data.zap_image_sha256 || ''); setSubfinderHash(data.subfinder_image_sha256 || ''); setAmassHash(data.amass_image_sha256 || '') }).catch((e) => setError(String(e)))
   }, [base])
-  useEffect(() => { setTokenA(''); setTokenB('') }, [base, job?.id])
   useEffect(() => {
     if (!job || !['queued', 'running'].includes(job.status)) return
     const timer = window.setInterval(() => {

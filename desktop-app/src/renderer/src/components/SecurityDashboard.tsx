@@ -39,6 +39,18 @@ export function SecurityDashboard({
   const [tab, setTab] = useState<'jobs' | 'evidence' | 'reports'>('jobs')
   const [error, setError] = useState('')
   const [revision, setRevision] = useState(0)
+  useEffect(() => {
+    const refresh = (): void => setRevision((value) => value + 1)
+    const resumed = (): void => {
+      if (document.visibilityState === 'visible') refresh()
+    }
+    window.addEventListener('online', refresh)
+    document.addEventListener('visibilitychange', resumed)
+    return () => {
+      window.removeEventListener('online', refresh)
+      document.removeEventListener('visibilitychange', resumed)
+    }
+  }, [])
   const project = projects.some((p) => p.id === projectId) ? projectId : ''
   const base =
     project && project === loadedProject && selected

@@ -15,7 +15,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, Response, Uploa
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, SecretStr, TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, TypeAdapter, ValidationError
 from fastapi.exceptions import RequestValidationError
 from sse_starlette.sse import EventSourceResponse
 from config import ROOT, WORKSPACE_DIR, MODELS, OLLAMA_URL, ALLOWED_ORIGINS, MODEL_TIMEOUT, WEB_DIST_DIR, DOCUMENT_EXTENSIONS, IMAGE_EXTENSIONS, MAX_UPLOAD
@@ -25,7 +25,8 @@ from security import ApiBoundary, load_token, session_cookie, image_ticket
 from store import Store
 from services import read_upload, ingest_document, ingest_image, prepare_chat, answer_chat, until_disconnect
 from agent import execute_agent_pipeline
-from router import detect_pipeline_route
+from router import detect_pipeline_route, mark_citations
+from runtime_status import runtime_status
 from tools import apply_proposal
 from pentest import Assessment, assess, targets, nmap_path
 import preferences
@@ -39,19 +40,30 @@ from security_orchestration import OrchestrationStore, OrchestrationWorker, rout
 from security_agents import SpecialistStore, SpecialistWorker, init_evidence_specialists, analyze_evidence_specialist, router as specialists_router
 from web_checks import WebRunner
 from bounded_scan import ScanRunner, ApprovedScanExecution, binary_hash
-from search_workspace import router as search_router
-from chat_web import web_context, linked_answer
+from search_workspace import router as search_router, searx_url
+from data_privacy import outbound_security, outbound_web, storage_overview
+from chat_web import web_context, linked_answer, user_message
 from deep_analysis import router as deep_analysis_router, init as init_deep_analysis, chat_report
 from chat_orchestrator import classify, security_slots
 from auto_governance import prepare_plan, create_approved_jobs
 from security_jobs import Stop, Approval as JobApproval
 from deep_analysis import AnalysisRequest, analyze
+from workspace_sync import WorkspaceSync, router as workspace_sync_router
+from readiness import router as readiness_router
 
 logger = logging.getLogger("agent.api")
 
 
 @asynccontextmanager
 async def lifespan(app):
+    from runtime_lock import runtime_lock
+    with runtime_lock(DATA_DIR):
+        async with app_lifespan(app):
+            yield
+
+
+@asynccontextmanager
+async def app_lifespan(app):
     load_token()
     preferences.load_settings()
     WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
@@ -59,6 +71,7 @@ async def lifespan(app):
     app.state.write_lock = asyncio.Lock()
     app.state.pentest_lock = asyncio.Lock()
     app.state.engagements = EngagementStore(DATA_DIR)
+    app.state.workspace_sync = WorkspaceSync(app.state.store, app.state.engagements)
     app.state.jobs = JobStore(app.state.engagements)
     app.state.evidence = EvidenceStore(app.state.engagements, app.state.jobs)
     app.state.web_runner = WebRunner(app.state.jobs, app.state.evidence)
@@ -88,6 +101,7 @@ async def lifespan(app):
 
 
 app = FastAPI(title="Jo Workspace", lifespan=lifespan)
+app.include_router(readiness_router)
 app.include_router(engagement_router)
 app.include_router(local_desktop_router)
 app.include_router(jobs_router)
@@ -96,6 +110,7 @@ app.include_router(mcp_router)
 app.include_router(orchestration_router)
 app.include_router(specialists_router)
 app.include_router(search_router)
+app.include_router(workspace_sync_router)
 app.include_router(deep_analysis_router)
 app.add_middleware(ApiBoundary)
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS,
@@ -191,6 +206,17 @@ async def get_gpu_status():
 async def metrics():
     return {"active": runtime.active, "waiting": runtime.waiting,
             "completed": runtime.completed, "failed": runtime.failed, "last": runtime.last_metrics}
+
+
+@app.get("/api/data/overview")
+async def data_overview():
+    return await asyncio.to_thread(storage_overview, DATA_DIR, WORKSPACE_DIR)
+
+
+@app.get("/api/runtime/status")
+async def get_runtime_status():
+    gpu = await asyncio.to_thread(gpu_status)
+    return await runtime_status(runtime, gpu, MODELS, preferences.current.inference)
 
 
 @app.get("/api/settings")
@@ -314,13 +340,14 @@ TRACE_PHASES = {"thinking": {"step": "thinking", "label": "Berpikir"},
 INTENT_LABELS = {"chat": "percakapan", "coding": "coding agent", "security": "pemeriksaan keamanan", "web": "pencarian web"}
 
 
-async def stream_answer(model, messages, out):
+async def stream_answer(model, messages, out, reasoning=True):
     """Stream reasoning and answer text as trace events; the raw answer lands in out['text'].
 
     Reasoning goes out as `thinking` events, never mixed into answer `token` events. If the
-    reasoning budget runs out before any answer, a second pass answers without thinking."""
+    reasoning budget runs out before any answer, a second pass answers without thinking.
+    With reasoning=False the model answers directly, skipping the thinking pass."""
     out["text"] = ""
-    for think in (True, False):
+    for think in ((True, False) if reasoning else (False,)):
         splitter, phase, exhausted = ThinkSplitter(), None, False
         async for chunk in runtime.chunks(model, messages, think=think):
             if chunk.get("status") == "running":
@@ -383,14 +410,17 @@ async def chat_endpoint(payload: ChatPayload, request: Request):
         try:
             model = payload.model_override or MODELS["reasoning" if payload.target == "vision" else payload.target]
             yield wire(event("status", step="queued", label="Menunggu giliran model"))
+            reasoning = True
             if payload.unified:
                 yield wire(event("status", step="routing", label="Menentukan jenis permintaan"))
                 router_model = payload.model_override or MODELS["reasoning"]
-                intent = await classify(payload.prompt, payload.history, router_model)
+                routed = await classify(payload.prompt, payload.history, router_model)
+                intent, reasoning = routed.intent, routed.reasoning
                 if payload.web_mode == "on" and intent == "chat":
                     intent = "web"
                 yield wire(event("status", step="routing", label="Menentukan jenis permintaan",
-                                 detail=f"Intent: {INTENT_LABELS[intent]} · router {router_model}"))
+                                 detail=f"Intent: {INTENT_LABELS[intent]} · "
+                                        f"{'dengan' if reasoning else 'tanpa'} penalaran · router {router_model}"))
                 if intent == "coding":
                     if payload.attachment_ids:
                         yield wire(event("result", result="Coding Agent belum menggunakan lampiran sebagai konteks. Lepaskan lampiran atau sebutkan file workspace yang ingin diperiksa.", sources=[], images=[]))
@@ -456,7 +486,8 @@ async def chat_endpoint(payload: ChatPayload, request: Request):
                         "ports": sorted({port for item in plans for port in item["ports"]}), "environment": plan["environment"], "project_id": project_id,
                         "account_refs": auth_jobs[0]['account_refs'] if auth_jobs else [],
                         "owner_json_pointer": auth_jobs[0]['owner_json_pointer'] if auth_jobs else '',
-                        "project_is_new": payload.project_id is None, "plan": plan, "model_override": payload.model_override})
+                        "project_is_new": payload.project_id is None, "plan": plan, "model_override": payload.model_override,
+                        "outbound": outbound_security(plans)})
                     yield wire(event("action_proposal", action={k: v for k, v in action.items() if k not in ("plan", "model_override")}))
                     yield wire(event("done"))
                     return
@@ -464,8 +495,9 @@ async def chat_endpoint(payload: ChatPayload, request: Request):
                     action = await asyncio.to_thread(request.app.state.store.propose_chat_action, payload.session_id, {
                         "intent": "web", "target": "Sumber web yang relevan dengan permintaan", "tools": ["Pencarian web", "Pembacaan halaman publik"],
                         "duration": "Bergantung pada respons sumber web", "summary": "Pencarian dapat mengirim pertanyaan ke penyedia pencarian serta mengakses halaman dan gambar publik yang relevan.",
-                        "prompt": payload.prompt, "history": [h.model_dump() for h in payload.history], "model_override": payload.model_override})
-                    yield wire(event("action_proposal", action={k: v for k, v in action.items() if k not in ("prompt", "history", "model_override")}))
+                        "prompt": payload.prompt, "history": [h.model_dump() for h in payload.history], "model_override": payload.model_override,
+                        "reasoning": reasoning, "outbound": outbound_web(user_message(payload.prompt), searx_url())})
+                    yield wire(event("action_proposal", action={k: v for k, v in action.items() if k not in ("prompt", "history", "model_override", "reasoning")}))
                     yield wire(event("done"))
                     return
             deep = chat_report(request.app.state, payload.project_id, payload.prompt) if payload.target == 'reasoning' and not payload.attachment_ids else None
@@ -492,14 +524,17 @@ async def chat_endpoint(payload: ChatPayload, request: Request):
             elif web:
                 yield wire(event("sources", sources=sources, images=images))
             out = {}
-            async for item in stream_answer(model, messages, out):
+            async for item in stream_answer(model, messages, out, reasoning=reasoning):
                 yield item
             answer = clean_answer(out["text"])
             if not answer or answer.lower().startswith("thinking process"):
                 raise ValueError("Model tidak menghasilkan jawaban akhir.")
             if web:
                 answer = linked_answer(answer, sources)
-            yield wire(event("result", result=answer, sources=sources, coverage=coverage, images=images))
+            elif coverage:
+                sources, coverage = mark_citations(answer, sources, coverage)
+            yield wire(event("result", result=answer, sources=sources, coverage=coverage, images=images,
+                             outbound=web.get("outbound") if web else None))
             yield wire(event("done"))
         except Exception as exc:
             yield wire(event("error", detail=error_text(exc)))
@@ -559,13 +594,14 @@ async def confirm_chat_action(action_id: str, payload: ChatActionDecision, reque
                                  detail=f"{len(web['sources'])} sumber · {len(web['images'])} gambar"))
                 yield wire(event("sources", sources=web["sources"]))
                 out = {}
-                async for item in stream_answer(model, web["messages"], out):
+                async for item in stream_answer(model, web["messages"], out, reasoning=action.get("reasoning", True)):
                     yield item
                 answer = clean_answer(out["text"])
                 if not answer:
                     raise ValueError("Model tidak menghasilkan jawaban akhir.")
                 images = [{**item, 'ticket': image_ticket(request.state.api_token, item['url'], int(time.time()) + 900)} for item in web['images']]
-                yield wire(event("result", result=linked_answer(answer, web["sources"]), sources=web["sources"], images=images))
+                yield wire(event("result", result=linked_answer(answer, web["sources"]), sources=web["sources"], images=images,
+                                 outbound=web.get("outbound")))
             elif action["intent"] == "attachment":
                 yield wire(event("result", result="Lampiran disetujui; siap diproses."))
             elif action["intent"] == "security":
@@ -720,8 +756,14 @@ class Approval(BaseModel):
     approve: bool
 
 
+class CodeApproval(Approval):
+    model_config = ConfigDict(extra="forbid")
+    # None applies the whole proposal; a list applies only those hunk indices.
+    hunks: list[int] | None = Field(default=None, min_length=1, max_length=500)
+
+
 @app.post("/api/chat/code-proposals/{proposal_id}/confirm")
-async def approve_proposal(proposal_id: str, payload: Approval, request: Request):
+async def approve_proposal(proposal_id: str, payload: CodeApproval, request: Request):
     # Serialize approval + application to prevent replay/parallel overwrites.
     async with request.app.state.write_lock:
         store = request.app.state.store
@@ -730,12 +772,15 @@ async def approve_proposal(proposal_id: str, payload: Approval, request: Request
         if not payload.approve:
             await asyncio.to_thread(store.finish, proposal_id, "rejected")
             return {"status": "rejected"}
+        total = len(proposal.get("hunks") or [])
+        selected = sorted(set(payload.hunks)) if payload.hunks is not None else None
+        partial = selected is not None and len(selected) < total
         try:
-            result = await asyncio.to_thread(apply_proposal, proposal)
+            result = await asyncio.to_thread(apply_proposal, proposal, selected if partial else None)
         except (ValueError, OSError) as exc:
             raise HTTPException(409, str(exc)) from exc
         await asyncio.to_thread(store.finish, proposal_id, "applied")
-        return {"status": "applied", **result}
+        return {"status": "partial" if partial else "applied", "applied_hunks": selected if partial else list(range(total)), **result}
 
 
 @app.delete("/api/attachments/{attachment_id}")
@@ -786,5 +831,14 @@ async def pentest_run(payload: Assessment | ApprovedScanExecution, request: Requ
         note=payload.note, acknowledge=payload.acknowledge))
 
 
+class WebDist(StaticFiles):
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        # Assets carry content hashes; the HTML entry must be revalidated or an update keeps the old UI.
+        if response.media_type == "text/html":
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 if WEB_DIST_DIR.is_dir():
-    app.mount("/", StaticFiles(directory=WEB_DIST_DIR, html=True), name="web")
+    app.mount("/", WebDist(directory=WEB_DIST_DIR, html=True), name="web")

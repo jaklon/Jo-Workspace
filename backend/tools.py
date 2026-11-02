@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from config import WORKSPACE_DIR, MAX_FILE_TEXT
+from code_review import apply_hunks, hunks, summary
 
 WORKSPACE_ROOT = str(WORKSPACE_DIR)
 FORBIDDEN = {".git", ".env", ".ssh", "node_modules", "venv", ".venv", "__pycache__", ".agent-backups"}
@@ -58,15 +59,21 @@ def proposal_payload(path, content):
     diff = "".join(difflib.unified_diff(old_text.splitlines(True), content.splitlines(True), fromfile=path+" (sebelum)", tofile=path+" (usulan)"))
     if not diff:
         raise ValueError("Tidak ada perubahan untuk diusulkan.")
-    return {"path": path, "content": content, "before_hash": hashlib.sha256(old).hexdigest() if old is not None else None, "diff": diff}
+    return {"path": path, "content": content, "before_hash": hashlib.sha256(old).hexdigest() if old is not None else None, "diff": diff,
+            "hunks": hunks(old_text, content), "review": summary(path, old_text, content, old is not None)}
 
 
-def apply_proposal(payload):
+def apply_proposal(payload, selected_hunks=None):
+    """Write the proposal, or only the selected hunks of it, after re-checking the file is unchanged."""
     target = Path(safe_path(payload["path"]))
     old = target.read_bytes() if target.exists() else None
     fingerprint = hashlib.sha256(old).hexdigest() if old is not None else None
     if fingerprint != payload["before_hash"]:
         raise ValueError("File berubah sejak proposal dibuat. Buat proposal baru agar perubahan terbaru tidak tertimpa.")
+    if selected_hunks is not None:
+        if old is None:
+            raise ValueError("File baru harus diterima utuh atau ditolak.")
+        payload = {**payload, "content": apply_hunks(old.decode("utf-8"), payload["content"], selected_hunks)}
     target.parent.mkdir(parents=True, exist_ok=True)
     safe_path(payload["path"])
     if old is not None:

@@ -162,6 +162,24 @@ class EvidenceBaselineTests(unittest.TestCase):
         from evidence_report import baseline
         self.assertIsNone(baseline(imported))
 
+    def test_tcp_connected_is_open_and_old_report_is_rechecked(self):
+        source = {'evidence_id': 't2', 'result': {'tool': 'tcp-connect', 'target': '127.0.0.1',
+                  'ports': [{'port': 11434, 'status': 'connected'}, {'port': 1, 'status': 'refused'},
+                            {'port': 2, 'status': 'inconclusive'}]}}
+        empty = {'summary': '', 'observations': [], 'limitations': [], 'recommendations': []}
+        result = grounded_output(empty, source)
+        self.assertEqual(result['summary'], 'Scan tcp-connect terhadap 127.0.0.1: 1 dari 3 port terbuka (11434).')
+        self.assertEqual(result['observations'], ['Port terbuka: 11434.', 'Port lain: 1 (refused), 2 (inconclusive).'])
+        self.assertTrue(result['recommendations'])
+        stored = {'grounding_version': 5, 'source': source, 'output': {
+            **empty, 'summary': 'Scan tcp-connect terhadap 127.0.0.1: 0 dari 3 port terbuka.',
+            'observations': ['Port terbuka: tidak ada.', 'Port lain: 11434 (connected).']}}
+        view = reviewed_report(stored)
+        self.assertEqual(view['grounding_status'], 'legacy_rechecked')
+        self.assertEqual(view['output']['summary'], result['summary'])
+        self.assertEqual(view['output']['observations'], result['observations'])
+        self.assertIn('0 dari 3', stored['output']['summary'])
+
     def test_fact_lines_survive_the_evidence_redactor(self):
         # deep_analysis scrubs the whole output; a fact line shaped like "Cookie: ..." was once redacted.
         from security_evidence import redactor

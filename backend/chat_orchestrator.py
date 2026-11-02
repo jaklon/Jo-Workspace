@@ -10,6 +10,8 @@ from model_runtime import bounded_messages, runtime
 class Intent(BaseModel):
     model_config = ConfigDict(extra="forbid")
     intent: Literal["chat", "coding", "security", "web"]
+    # Thinking costs minutes on local hardware; only spend it where step-by-step reasoning pays off.
+    reasoning: bool = Field(description="true hanya jika jawaban butuh penalaran bertahap")
 
 
 ToolName = Literal["http-head", "tcp-connect", "nmap", "nuclei-head", "zap-head", "subfinder-passive", "amass-passive", "inventory-html", "js-bundle-inventory", "auth-unauthenticated-get", "auth-two-session", "scoped-spider", "active-reflection", "monitoring-local", "document-review", "unsupported"]
@@ -253,11 +255,14 @@ async def classify(prompt, history, model):
         "pemeriksaan keamanan pada target; web jika meminta pencarian online. "
         "Pertanyaan umum, penjelasan kode, dan diskusi keamanan adalah chat. Jika pesan terbaru "
         "menjawab pertanyaan lanjutan tentang parameter pemeriksaan keamanan yang belum selesai, pilih security. "
+        "Isi reasoning true hanya jika jawaban butuh penalaran bertahap: soal matematika atau logika "
+        "bertingkat, debugging, analisis mendalam, perbandingan, atau perencanaan. Sapaan, fakta singkat, "
+        "definisi, terjemahan, aritmetika sederhana, dan ringkasan adalah false. "
         "Jangan menjalankan tool. Kembalikan JSON sesuai skema.", prompt, history)
     result = await runtime.chat(model, messages, format_schema=Intent.model_json_schema(), output_tokens=128)
     if result.get("tool_calls"):
         raise ValueError("Router tidak boleh memanggil tool.")
     try:
-        return Intent.model_validate_json(result["content"]).intent
+        return Intent.model_validate_json(result["content"])
     except ValueError as exc:
         raise ValueError("Router tidak dapat menentukan jenis permintaan. Coba jelaskan tugas lebih spesifik.") from exc

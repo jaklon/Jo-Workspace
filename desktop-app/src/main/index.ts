@@ -2,6 +2,7 @@ import { app, shell, BrowserWindow, dialog, ipcMain, session } from 'electron'
 import { join } from 'node:path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { startDesktopRuntime, type DesktopRuntime } from './desktop-runtime'
+import { recoveryProfile } from './recovery-profile'
 import icon from '../../resources/agent-os.png?asset'
 
 app.setName('Jo Workspace')
@@ -9,7 +10,11 @@ let mainWindow: BrowserWindow | null = null
 let desktopRuntime: DesktopRuntime | null = null
 const bundledBackend = app.isPackaged && process.platform === 'win32'
 // Preserve existing Electron storage across the branding change.
-app.setPath('userData', join(app.getPath('appData'), bundledBackend ? 'Agent OS' : 'agent-os'))
+app.setPath(
+  'userData',
+  recoveryProfile(process.env.JO_WORKSPACE_DATA_DIR) ||
+    join(app.getPath('appData'), bundledBackend ? 'Agent OS' : 'agent-os')
+)
 
 async function createWindow(): Promise<void> {
   mainWindow = new BrowserWindow({
@@ -30,7 +35,9 @@ async function createWindow(): Promise<void> {
       nodeIntegration: false
     }
   })
-  mainWindow.on('ready-to-show', () => mainWindow?.show())
+  mainWindow.on('ready-to-show', () => {
+    if (process.env.JO_TEST_HIDDEN !== '1') mainWindow?.show()
+  })
   mainWindow.on('closed', () => {
     mainWindow = null
   })

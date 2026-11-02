@@ -1,6 +1,116 @@
-import type { ChatSessionMap, Project } from './types'
-import { TAB_TYPES } from './sessions'
-import type { Preferences } from './preferences'
+import type { ActiveSessionMap, ChatSessionMap, Project } from './types'
+import { TAB_TYPES, validate } from './sessions'
+import { sanitizeMemory } from './project-memory'
+import { normalizePreferences, type Preferences } from './preferences'
+
+export function exportRecoverySnapshot(
+  sessions: ChatSessionMap,
+  activeSessions: ActiveSessionMap,
+  projects: Project[],
+  preferences: Preferences
+): string {
+  return JSON.stringify({
+    format: 'jo-browser-recovery',
+    version: 1,
+    projects,
+    preferences,
+    activeSessions,
+    sessions: Object.fromEntries(
+      TAB_TYPES.map((tab) => [
+        tab,
+        sessions[tab].map((session) => ({
+          ...session,
+          attachments: session.attachments ?? [],
+          messages: session.messages.map(
+            ({ role, content, visualAnalysis, trace, thinking, sources, coverage }) => ({
+              role,
+              content,
+              visualAnalysis,
+              trace,
+              thinking,
+              sources,
+              coverage
+            })
+          )
+        }))
+      ])
+    )
+  })
+}
+
+export function importRecoverySnapshot(text: string): {
+  sessions: ChatSessionMap
+  activeSessions: ActiveSessionMap
+  projects: Project[]
+  preferences: Preferences
+} {
+  const value = JSON.parse(text)
+  if (
+    value?.format !== 'jo-browser-recovery' ||
+    value.version !== 1 ||
+    !Array.isArray(value.projects) ||
+    value.projects.length > 500 ||
+    !value.sessions ||
+    !value.activeSessions
+  )
+    throw new Error('Snapshot pemulihan browser tidak valid.')
+  const ids = new Set<string>()
+  for (const project of value.projects) {
+    if (
+      !project ||
+      typeof project.id !== 'string' ||
+      !project.id ||
+      ids.has(project.id) ||
+      typeof project.name !== 'string' ||
+      !project.name.trim() ||
+      project.name.length > 80 ||
+      typeof project.instructions !== 'string' ||
+      project.instructions.length > 1500
+    )
+      throw new Error('Data project snapshot tidak valid.')
+    ids.add(project.id)
+  }
+  const sessionIds = new Set<string>()
+  for (const tab of TAB_TYPES) {
+    const rows = value.sessions[tab]
+    if (!Array.isArray(rows) || rows.length > 500)
+      throw new Error('Daftar chat snapshot tidak valid.')
+    for (const session of rows) {
+      if (
+        !session ||
+        typeof session.id !== 'string' ||
+        !session.id ||
+        sessionIds.has(session.id) ||
+        typeof session.title !== 'string' ||
+        !Array.isArray(session.messages) ||
+        session.messages.length > 100 ||
+        (session.projectId != null && !ids.has(session.projectId)) ||
+        !Array.isArray(session.attachments) ||
+        session.attachments.length > 4 ||
+        session.attachments.some((a: { id?: unknown }) => !a || typeof a.id !== 'string') ||
+        session.messages.some(
+          (m: { role?: unknown; content?: unknown }) =>
+            !m ||
+            !['user', 'assistant'].includes(m.role as string) ||
+            typeof m.content !== 'string' ||
+            m.content.length > 200000
+        )
+      )
+        throw new Error('Chat snapshot tidak valid.')
+      sessionIds.add(session.id)
+    }
+  }
+  const cleaned = JSON.parse(
+    exportRecoverySnapshot(
+      value.sessions,
+      value.activeSessions,
+      value.projects,
+      normalizePreferences(value.preferences)
+    )
+  )
+  const restored = validate(cleaned)
+  return { ...restored, preferences: normalizePreferences(value.preferences) }
+}
 
 export function exportBackup(
   sessions: ChatSessionMap,
@@ -62,6 +172,7 @@ export function importBackup(text: string): { sessions: ChatSessionMap; projects
       id,
       name: p.name.slice(0, 80),
       instructions: p.instructions.slice(0, 1500),
+      memory: sanitizeMemory(p.memory),
       createdAt: Date.now()
     }
   })

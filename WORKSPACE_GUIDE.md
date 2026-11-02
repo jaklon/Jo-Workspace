@@ -69,6 +69,11 @@ layanan cloud tidak dihitung. Statistik dapat difilter dan diekspor sebagai JSON
 
 ## Penyimpanan dan cadangan
 
+Untuk cadangan gabungan runtime, workspace, dan snapshot browser serta pemulihan
+terisolasi di mode source, lihat [panduan pemulihan](RECOVERY_BACKUP.md). Alur
+tersebut memerlukan backend berhenti dan memakai perintah lokal; Electron dapat
+membuka hasil pemulihan sebagai profil terpisah tanpa mengganti profil aktif.
+
 Riwayat dan project disimpan pada IndexedDB browser, preferensi pada localStorage.
 Data tidak otomatis tersinkron ke perangkat lain. Batas riwayat adalah 500 chat
 per mode dan 100 pesan terbaru per chat. Gambar asli tidak disimpan dalam riwayat.

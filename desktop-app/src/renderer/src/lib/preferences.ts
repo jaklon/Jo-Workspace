@@ -103,7 +103,8 @@ export function downloadFile(name: string, content: string, type = 'application/
 export function personalizedPrompt(
   prompt: string,
   preferences: Preferences,
-  projectInstructions = ''
+  projectInstructions = '',
+  projectMemory = ''
 ): string {
   const parts = [
     preferences.responseLanguage === 'auto'
@@ -117,7 +118,8 @@ export function personalizedPrompt(
         ? 'Jelaskan secara terperinci dengan contoh bila membantu.'
         : '',
     preferences.customInstructions,
-    projectInstructions ? `Instruksi project: ${projectInstructions}` : ''
+    projectInstructions ? `Instruksi project: ${projectInstructions}` : '',
+    projectMemory
   ].filter(Boolean)
   return `${parts.join('\n')}\n\nPesan pengguna:\n${prompt}`
 }

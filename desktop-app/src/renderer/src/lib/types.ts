@@ -17,6 +17,10 @@ export interface Source {
   filename?: string
   line_start?: number
   line_end?: number
+  section?: number
+  location?: string
+  matched?: boolean
+  cited?: boolean
   kind?: 'web'
   title?: string
   url?: string
@@ -33,12 +37,31 @@ export interface Coverage {
   selected: number
   total: number
   complete: boolean
+  matched?: number
+  cited?: number
+  unreadable_pages?: number[]
+}
+export interface ProposalHunk {
+  index: number
+  header: string
+  added: number
+  removed: number
+  diff: string
 }
 export interface Proposal {
   id: string
   path: string
   diff: string
-  state?: 'applied' | 'rejected'
+  hunks?: ProposalHunk[]
+  review?: {
+    new_file: boolean
+    added: number
+    removed: number
+    hunk_count: number
+    risks: string[]
+  }
+  state?: 'applied' | 'partial' | 'rejected'
+  appliedHunks?: number[]
 }
 export interface ActionProposal {
   id: string
@@ -53,7 +76,18 @@ export interface ActionProposal {
   owner_json_pointer?: string
   project_id?: string
   project_is_new?: boolean
+  outbound?: OutboundDisclosure
   state?: 'submitted' | 'cancelled'
+}
+export interface OutboundDisclosure {
+  leaves_device: boolean
+  sent: string[]
+  destinations: string[]
+  not_sent: string[]
+}
+export interface OutboundLog {
+  query: string | null
+  pages: string[]
 }
 export interface AnalysisProgress {
   step: string
@@ -98,6 +132,7 @@ export interface Message {
   coverage?: Coverage
   proposals?: Proposal[]
   action?: ActionProposal
+  outbound?: OutboundLog
 }
 export interface ChatSession {
   id: string
@@ -110,10 +145,22 @@ export interface ChatSession {
   pinned?: boolean
   archived?: boolean
 }
+export type ProjectFactKind = 'goal' | 'decision' | 'term' | 'note'
+export interface ProjectFact {
+  id: string
+  kind: ProjectFactKind
+  text: string
+  source:
+    | { kind: 'manual' }
+    | { kind: 'chat'; sessionId?: string; sessionTitle?: string; excerpt?: string }
+  createdAt: number
+  updatedAt: number
+}
 export interface Project {
   id: string
   name: string
   instructions: string
+  memory?: ProjectFact[]
   createdAt: number
 }
 export type ChatSessionMap = Record<TabType, ChatSession[]>
@@ -137,6 +184,7 @@ export interface StreamEvent {
   attachment?: Attachment
   sources?: Source[]
   images?: WebImage[]
+  outbound?: OutboundLog | null
   coverage?: Coverage
   visual_analysis?: string | null
   proposals?: Proposal[]

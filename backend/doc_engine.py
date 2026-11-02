@@ -6,6 +6,8 @@ from docx import Document
 from pypdf import PdfReader
 from config import DOCUMENT_EXTENSIONS, MAX_EXTRACTED
 
+UNREADABLE_PAGE = "[Halaman {page} tidak terbaca: tidak ada lapisan teks, perlu OCR]"
+
 
 def validate_archive(data):
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
@@ -25,10 +27,12 @@ def extract_text_from_pdf(data):
         if text.strip():
             sections.append(f"[Halaman {i}]\n{text}")
         else:
+            # Keep a marker so answers and coverage can say which pages were never read.
+            sections.append(UNREADABLE_PAGE.format(page=i))
             empty.append(str(i))
         if sum(map(len, sections)) > MAX_EXTRACTED:
             raise ValueError("Teks dokumen terlalu panjang. Pisahkan dokumen.")
-    if empty:
+    if len(empty) == len(reader.pages):
         raise ValueError("PDF memerlukan OCR pada halaman " + ", ".join(empty[:20]) + ". Unggah PDF dengan lapisan teks atau halaman tersebut sebagai gambar.")
     return "\n\n".join(sections)
 

@@ -24,7 +24,8 @@ import {
   ChartNoAxesCombined,
   Folder,
   Square,
-  ArrowUp
+  ArrowUp,
+  BookmarkPlus
 } from 'lucide-react'
 
 import type {
@@ -39,11 +40,18 @@ import type {
 import { apiFetch, consumeStream, disconnect } from './lib/api'
 import { createSession, useSessions, TAB_TYPES } from './lib/sessions'
 import { downloadFile, personalizedPrompt, usePreferences } from './lib/preferences'
-import { exportBackup, importBackup } from './lib/backup'
+import {
+  exportBackup,
+  exportRecoverySnapshot,
+  importBackup,
+  importRecoverySnapshot
+} from './lib/backup'
 import { WorkspaceSidebar, type SessionRow } from './components/WorkspaceSidebar'
 import { Settings } from './components/Settings'
 import { Usage } from './components/Usage'
 import { ProjectEditor, SessionEditor } from './components/OrganizeDialogs'
+import { SaveToMemoryDialog } from './components/ProjectMemory'
+import { EXCERPT_LIMIT, memoryPrompt, upsertFact } from './lib/project-memory'
 import { Connection } from './components/Connection'
 import { MarkdownAnswer, MessageDetails, MessageImage } from './components/MessageDetails'
 import { MessageTrace } from './components/MessageTrace'
@@ -75,6 +83,7 @@ export default function App(): JSX.Element {
   const [projectEditor, setProjectEditor] = useState<Project | 'new' | null>(null)
   const [sessionEditor, setSessionEditor] = useState<SessionRow | null>(null)
   const [prompt, setPrompt] = useState('')
+  const [loading, setLoading] = useState(false)
   const {
     sessionsByTab,
     setSessionsByTab,
@@ -83,8 +92,12 @@ export default function App(): JSX.Element {
     ready,
     storageError,
     projects,
-    setProjects
-  } = useSessions()
+    setProjects,
+    syncStatus,
+    syncConflicts,
+    importSyncedRecovery,
+    reviewSyncConflict
+  } = useSessions(loading)
   const [needsAuth, setNeedsAuth] = useState(false)
   const [connectionVersion, setConnectionVersion] = useState(0)
   const [connectionState, setConnectionState] = useState('Memeriksa koneksi')
@@ -106,11 +119,14 @@ export default function App(): JSX.Element {
     >()
   )
   const abortRef = useRef<AbortController | null>(null)
-  const [loading, setLoading] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => window.innerWidth < 1024)
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null)
   const [gpuStats, setGpuStats] = useState({ used: 0, total: 0, percent: 0 })
-  const messagesEndRef = useRef<HTMLDivElement>(null)
+  const messagesRef = useRef<HTMLDivElement>(null)
+  const followMessages = useRef(true)
+  const touchStartY = useRef<number | null>(null)
+  const scrollDirection = useRef(0)
+  const [latestState, setLatestState] = useState({ sessionId: '', visible: false })
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
   const [fileError, setFileError] = useState('')
   const [imageFile, setImageFile] = useState<File | null>(null)
@@ -123,6 +139,7 @@ export default function App(): JSX.Element {
     sessionsByTab[activeTab][0]
   const currentMessages = currentSession.messages
   const currentProject = projects.find((p) => p.id === currentSession.projectId)
+  const [memoryDraft, setMemoryDraft] = useState<{ excerpt: string } | null>(null)
   const [workspaceNotice, setWorkspaceNotice] = useState('')
 
   const appendMessageToActiveTab = (message: Message): void => {
@@ -220,21 +237,9 @@ export default function App(): JSX.Element {
     setSessionEditor(null)
   }
 
-  const removeSessionAttachments = async (session: ChatSession): Promise<void> => {
-    await Promise.all(
-      (session.attachments || []).map((a) =>
-        apiFetch(
-          `/api/attachments/${encodeURIComponent(a.id)}?session_id=${encodeURIComponent(session.id)}`,
-          { method: 'DELETE' }
-        )
-      )
-    )
-  }
-
   const deleteSession = async (): Promise<void> => {
     if (!sessionEditor) return
     const { tab, session } = sessionEditor
-    await removeSessionAttachments(session)
     const remaining = sessionsByTab[tab].filter((s) => s.id !== session.id)
     if (!remaining.length) remaining.push(createSession())
     setSessionsByTab((prev) => ({ ...prev, [tab]: remaining }))
@@ -260,7 +265,6 @@ export default function App(): JSX.Element {
 
   const clearAll = async (): Promise<void> => {
     await assertProjectsRemovable(projects.map((p) => p.id))
-    await Promise.all(TAB_TYPES.flatMap((tab) => sessionsByTab[tab]).map(removeSessionAttachments))
     const fresh = Object.fromEntries(
       TAB_TYPES.map((tab) => [tab, [createSession()]])
     ) as typeof sessionsByTab
@@ -277,8 +281,16 @@ export default function App(): JSX.Element {
   }
 
   const importData = async (file: File): Promise<void> => {
-    if (file.size > 10 * 1024 * 1024) throw new Error('Batas cadangan 10 MB.')
-    const backup = importBackup(await file.text())
+    if (file.size > 50 * 1024 * 1024) throw new Error('Batas cadangan 50 MB.')
+    const text = await file.text()
+    if (JSON.parse(text)?.format === 'jo-browser-recovery') {
+      const recovery = importRecoverySnapshot(text)
+      importSyncedRecovery(recovery)
+      setPreferences(recovery.preferences)
+      return
+    }
+    if (file.size > 10 * 1024 * 1024) throw new Error('Batas cadangan JSON lama 10 MB.')
+    const backup = importBackup(text)
     if (
       projects.length + backup.projects.length > 500 ||
       TAB_TYPES.some((tab) => sessionsByTab[tab].length + backup.sessions[tab].length > 500)
@@ -404,22 +416,53 @@ export default function App(): JSX.Element {
     }
   }
 
-  const scrollToBottom = (): void => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }
+  useEffect(() => {
+    followMessages.current = true
+    scrollDirection.current = 0
+  }, [activeTab, currentSession.id])
 
   useEffect(() => {
-    if (preferences.autoScroll) scrollToBottom()
-  }, [activeTab, currentMessages, preferences.autoScroll])
+    const element = messagesRef.current
+    if (preferences.autoScroll && followMessages.current && element)
+      element.scrollTop = element.scrollHeight
+  }, [activeTab, currentSession.id, currentMessages, preferences.autoScroll])
+
+  const updateScrollPosition = (): void => {
+    const element = messagesRef.current
+    if (!element) return
+    const nearBottom = element.scrollHeight - element.clientHeight - element.scrollTop <= 64
+    if (!nearBottom) followMessages.current = false
+    else if (scrollDirection.current > 0) followMessages.current = true
+    setLatestState({ sessionId: currentSession.id, visible: !followMessages.current })
+  }
+  const pauseFollowing = (): void => {
+    followMessages.current = false
+    setLatestState({ sessionId: currentSession.id, visible: true })
+  }
+  const jumpToLatest = (): void => {
+    const element = messagesRef.current
+    if (!element) return
+    followMessages.current = true
+    scrollDirection.current = 0
+    element.scrollTop = element.scrollHeight
+    setLatestState({ sessionId: currentSession.id, visible: false })
+  }
 
   useEffect(() => {
     const requireAuth = (): void => setNeedsAuth(true)
     window.addEventListener('agent-auth-required', requireAuth)
     const refresh = (): void => setConnectionVersion((v) => v + 1)
+    const resumed = (): void => {
+      if (document.visibilityState === 'visible') refresh()
+    }
     window.addEventListener('agent-settings-changed', refresh)
+    window.addEventListener('online', refresh)
+    document.addEventListener('visibilitychange', resumed)
     return () => {
       window.removeEventListener('agent-auth-required', requireAuth)
       window.removeEventListener('agent-settings-changed', refresh)
+      window.removeEventListener('online', refresh)
+      document.removeEventListener('visibilitychange', resumed)
     }
   }, [])
 
@@ -590,7 +633,12 @@ export default function App(): JSX.Element {
       .map(({ role, content }) => ({ role, content: content.slice(0, 16000) }))
     const userText =
       prompt.trim() || (visionUpload ? 'Jelaskan gambar ini.' : 'Ringkas dokumen ini.')
-    const requestPrompt = personalizedPrompt(userText, preferences, currentProject?.instructions)
+    const requestPrompt = personalizedPrompt(
+      userText,
+      preferences,
+      currentProject?.instructions,
+      memoryPrompt(currentProject?.memory).text
+    )
     if (requestPrompt.length > 6000) {
       setFileError(
         'Pesan beserta instruksi pribadi/project maksimal 6000 karakter. Persingkat pesan atau instruksi.'
@@ -695,6 +743,7 @@ export default function App(): JSX.Element {
           ...pending,
           content: event.result || '',
           proposals: event.proposals,
+          outbound: event.outbound || undefined,
           trace: finishTrace(pending.trace)
         }
       if (event.type === 'action_proposal' && event.action)
@@ -741,17 +790,21 @@ export default function App(): JSX.Element {
     }
   }
 
-  const handleProposal = async (id: string, approve: boolean): Promise<void> => {
-    await apiFetch('/api/chat/code-proposals/' + id + '/confirm', {
+  const handleProposal = async (id: string, approve: boolean, hunks?: number[]): Promise<void> => {
+    const response = await apiFetch('/api/chat/code-proposals/' + id + '/confirm', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: currentSession.id, approve })
+      body: JSON.stringify({ session_id: currentSession.id, approve, ...(hunks ? { hunks } : {}) })
     })
+    const result = (await response.json()) as {
+      status: 'applied' | 'partial' | 'rejected'
+      applied_hunks?: number[]
+    }
     setMessagesInActiveSession((messages) =>
       messages.map((m) => ({
         ...m,
         proposals: m.proposals?.map((p) =>
-          p.id === id ? { ...p, state: approve ? 'applied' : 'rejected' } : p
+          p.id === id ? { ...p, state: result.status, appliedHunks: result.applied_hunks } : p
         )
       }))
     )
@@ -920,7 +973,9 @@ export default function App(): JSX.Element {
             content: event.result || '',
             proposals: event.proposals,
             sources: event.sources,
+            coverage: event.coverage,
             webImages: event.images,
+            outbound: event.outbound || undefined,
             trace: finishTrace(pending.trace)
           }
         replacePendingMessageInActiveTab({ ...pending })
@@ -963,10 +1018,6 @@ export default function App(): JSX.Element {
   )
 
   const detachAttachment = async (id: string): Promise<void> => {
-    await apiFetch(
-      '/api/attachments/' + id + '?session_id=' + encodeURIComponent(currentSession.id),
-      { method: 'DELETE' }
-    )
     setSessionsByTab((prev) => ({
       ...prev,
       [activeTab]: prev[activeTab].map((s) =>
@@ -1147,6 +1198,60 @@ export default function App(): JSX.Element {
                 </button>
               </div>
             )}
+            <div className="notice" role="status">
+              {syncStatus}
+            </div>
+            {syncConflicts.map((conflict) => (
+              <div className="notice" role="alert" key={conflict.key}>
+                <strong>
+                  Konflik {conflict.remote.kind === 'project' ? 'project' : 'chat'}:{' '}
+                  {conflict.remote.id}
+                </strong>
+                <p>Perubahan lokal dan server berbeda. Tinjau kedua versi sebelum memilih.</p>
+                <details>
+                  <summary>Lihat versi perangkat ini</summary>
+                  <pre className="max-h-48 overflow-auto whitespace-pre-wrap">
+                    {JSON.stringify(conflict.local, null, 2)}
+                  </pre>
+                </details>
+                <details>
+                  <summary>Lihat versi server</summary>
+                  <pre className="max-h-48 overflow-auto whitespace-pre-wrap">
+                    {conflict.remote.deleted
+                      ? 'Dihapus di server'
+                      : JSON.stringify(conflict.remote.data, null, 2)}
+                  </pre>
+                </details>
+                <button
+                  disabled={loading}
+                  onClick={() => reviewSyncConflict(conflict.key, 'local')}
+                >
+                  Gunakan versi perangkat ini
+                </button>{' '}
+                <button
+                  disabled={loading}
+                  onClick={() => {
+                    if (
+                      window.confirm(
+                        'Versi lokal item ini akan diganti oleh versi server. Lanjutkan?'
+                      )
+                    ) {
+                      try {
+                        reviewSyncConflict(conflict.key, 'remote')
+                      } catch (error) {
+                        setWorkspaceNotice(
+                          error instanceof Error
+                            ? error.message
+                            : 'Konflik belum dapat diselesaikan.'
+                        )
+                      }
+                    }
+                  }}
+                >
+                  Gunakan versi server
+                </button>
+              </div>
+            ))}
             {currentSession.attachments?.length || loading || storageError ? (
               <div className="conversation-toolbar flex min-h-12 flex-wrap items-center justify-between gap-3 border-b border-white/[.04] px-4 py-2 text-xs text-slate-300 sm:px-8">
                 <span />
@@ -1184,7 +1289,32 @@ export default function App(): JSX.Element {
             ) : null}
             <>
               {/* Message Thread */}
-              <div className="scrollbar-thin min-h-0 flex-1 space-y-5 overflow-y-auto overscroll-contain px-3 py-4 sm:space-y-6 sm:px-8 sm:py-8">
+              <div
+                ref={messagesRef}
+                aria-label="Pesan percakapan"
+                onScroll={updateScrollPosition}
+                onWheel={(event) => {
+                  if (event.deltaY === 0) return
+                  scrollDirection.current = Math.sign(event.deltaY)
+                  if (event.deltaY < 0) pauseFollowing()
+                }}
+                onTouchStart={(event) => {
+                  touchStartY.current = event.touches[0]?.clientY ?? null
+                }}
+                onTouchMove={(event) => {
+                  const y = event.touches[0]?.clientY
+                  if (y != null && touchStartY.current != null) {
+                    const delta = y - touchStartY.current
+                    if (Math.abs(delta) > 1) scrollDirection.current = delta > 0 ? -1 : 1
+                    if (delta > 1) pauseFollowing()
+                    touchStartY.current = y
+                  }
+                }}
+                onTouchEnd={() => {
+                  touchStartY.current = null
+                }}
+                className="scrollbar-thin min-h-0 flex-1 space-y-5 overflow-y-auto overscroll-contain px-3 py-4 sm:space-y-6 sm:px-8 sm:py-8"
+              >
                 {currentMessages.length === 0 ? (
                   <div className="welcome-panel mx-auto flex min-h-full max-w-3xl flex-col items-center justify-center py-5 text-center sm:pb-12">
                     <BrandMark large />
@@ -1300,6 +1430,18 @@ export default function App(): JSX.Element {
                           )}
                         </div>
 
+                        {currentProject && msg.content && !msg.content.startsWith('⚠️') && (
+                          <button
+                            onClick={(): void =>
+                              setMemoryDraft({ excerpt: msg.content.slice(0, EXCERPT_LIMIT) })
+                            }
+                            className={`absolute ${msg.role === 'assistant' ? 'right-11' : 'right-2'} top-2 grid h-8 w-8 place-items-center rounded-lg border border-slate-700/60 bg-slate-800/90 text-slate-400 opacity-100 transition-opacity hover:text-white sm:opacity-0 sm:group-hover:opacity-100`}
+                            title="Simpan ke memori project"
+                            aria-label="Simpan ke memori project"
+                          >
+                            <BookmarkPlus size={12} />
+                          </button>
+                        )}
                         {msg.role === 'assistant' && msg.content && (
                           <button
                             onClick={(): void => copyToClipboard(msg.content, idx)}
@@ -1323,8 +1465,15 @@ export default function App(): JSX.Element {
                     </div>
                   ))
                 )}
-                <div ref={messagesEndRef} />
               </div>
+
+              {latestState.sessionId === currentSession.id && latestState.visible && (
+                <div className="flex shrink-0 justify-center py-1">
+                  <button type="button" className="secondary-button" onClick={jumpToLatest}>
+                    Ke pesan terbaru
+                  </button>
+                </div>
+              )}
 
               {/* Input Bar */}
               <div className="composer-area shrink-0 border-t border-white/[.06] bg-[#0b0f17]/90 p-3 backdrop-blur-xl sm:p-5">
@@ -1498,6 +1647,12 @@ export default function App(): JSX.Element {
               exportBackup(sessionsByTab, projects, preferences)
             )
           }
+          onRecoveryExport={() =>
+            downloadFile(
+              'jo-browser-recovery.json',
+              exportRecoverySnapshot(sessionsByTab, activeSessions, projects, preferences)
+            )
+          }
           onImport={importData}
           onClearAll={clearAll}
           onArchiveAll={() =>
@@ -1534,17 +1689,39 @@ export default function App(): JSX.Element {
             )
           }}
           disabled={loading || !ready}
+          exportDisabled={loading}
+        />
+      )}
+      {memoryDraft && currentProject && (
+        <SaveToMemoryDialog
+          projectName={currentProject.name}
+          excerpt={memoryDraft.excerpt}
+          sessionId={currentSession.id}
+          sessionTitle={currentSession.title}
+          onClose={() => setMemoryDraft(null)}
+          onSave={(fact) => {
+            try {
+              const memory = upsertFact(currentProject.memory || [], fact)
+              setProjects((prev) =>
+                prev.map((p) => (p.id === currentProject.id ? { ...p, memory } : p))
+              )
+              setMemoryDraft(null)
+            } catch (e) {
+              setFileError(e instanceof Error ? e.message : String(e))
+              setMemoryDraft(null)
+            }
+          }}
         />
       )}
       {projectEditor && (
         <ProjectEditor
           project={projectEditor === 'new' ? null : projectEditor}
           onClose={() => setProjectEditor(null)}
-          onSave={(name, instructions) => {
+          onSave={(name, instructions, memory) => {
             const project =
               projectEditor === 'new'
-                ? { id: crypto.randomUUID(), createdAt: Date.now(), name, instructions }
-                : { ...projectEditor, name, instructions }
+                ? { id: crypto.randomUUID(), createdAt: Date.now(), name, instructions, memory }
+                : { ...projectEditor, name, instructions, memory }
             setProjects((prev) =>
               projectEditor === 'new'
                 ? [...prev, project]

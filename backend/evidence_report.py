@@ -108,8 +108,9 @@ def tcp_baseline(result):
     ports = [item for item in result.get('ports') or [] if isinstance(item, dict) and isinstance(item.get('port'), int)]
     if not ports:
         return None
-    opened = sorted(item['port'] for item in ports if item.get('status') == 'open')
-    others = sorted((item['port'], str(item.get('status') or 'unknown')) for item in ports if item.get('status') != 'open')
+    open_statuses = {'open', 'connected'}
+    opened = sorted(item['port'] for item in ports if item.get('status') in open_statuses)
+    others = sorted((item['port'], str(item.get('status') or 'unknown')) for item in ports if item.get('status') not in open_statuses)
     target = result.get('target')
     observations = ['Port terbuka: ' + (', '.join(map(str, opened)) if opened else 'tidak ada') + '.']
     if others:

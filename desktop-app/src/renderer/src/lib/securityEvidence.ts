@@ -76,9 +76,44 @@ export interface RecordsListing {
   reports: { id: string; title: string; created_at: string; hash: string }[]
   execution_enabled: false
 }
+export interface ReportFindingView {
+  id: string
+  title: string
+  status: FindingStatus
+  status_label: string
+  severity_label: string
+  severity_reason: string
+  target: string
+  confidence: string
+  confidence_reason: string
+  review: { actor: string; assessment: string; at: string } | null
+}
+export interface ReportView {
+  owner_summary: {
+    headline: string
+    open_by_severity: Record<string, number>
+    fixed: number
+    unreviewed: number
+    dismissed: number
+  }
+  reviewed: ReportFindingView[]
+  unreviewed: ReportFindingView[]
+  follow_ups: Array<{ title: string; action: string }>
+  comparison: {
+    previous_title: string
+    previous_created_at: string
+    new: string[]
+    removed: string[]
+    still_open: string[]
+    changed: Array<{ title: string; from: string; to: string; resolved: boolean }>
+    evidence_added: number
+  } | null
+}
 export interface SecurityReport {
   hash: string
   markdown: string
+  readable_markdown?: string
+  view?: ReportView
   snapshot: {
     id: string
     title: string

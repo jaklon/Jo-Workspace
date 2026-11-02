@@ -13,7 +13,7 @@ export async function apiFetch(path: string, options: RequestInit = {}): Promise
     const body = await response.json().catch(() => ({}))
     const detail = apiErrorDetail(body.detail, response.status)
     if (response.status === 401) window.dispatchEvent(new Event('agent-auth-required'))
-    throw new Error(detail)
+    throw Object.assign(new Error(detail), { status: response.status })
   }
   return response
 }

@@ -5,7 +5,7 @@
   "main": "./out/main/index.js",
   "author": "Jo Workspace",
   "scripts": {
-    "test": "node ../scripts/test-streams.mjs && node ../scripts/test-workspace.mjs && node ../scripts/test-engagements.mjs && node ../scripts/test-orchestration-ui.mjs && node ../scripts/test-agents-ui.mjs",
+    "test": "node ../scripts/test-streams.mjs && node ../scripts/test-workspace.mjs && node ../scripts/test-engagements.mjs && node ../scripts/test-orchestration-ui.mjs && node ../scripts/test-agents-ui.mjs && node ../scripts/test-recovery-profile.mjs && node ../scripts/test-sync-merge.mjs && node ../scripts/test-workspace-sync.mjs && node ../scripts/test-project-memory.mjs && node ../scripts/test-citations.mjs",
     "format": "prettier --write .",
     "lint": "eslint --cache .",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json --composite false",
@@ -26,6 +26,7 @@
     "@electron-toolkit/utils": "^4.0.0",
     "electron-updater": "^6.3.9",
     "lucide-react": "^1.42.0",
+    "qrcode.react": "^4.2.0",
     "react-markdown": "^10.1.0"
   },
   "devDependencies": {

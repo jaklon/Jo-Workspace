@@ -29,6 +29,9 @@ import { Modal } from './Modal'
 import { apiFetch, API_BASE_URL } from '../lib/api'
 import { defaultPreferences, type Preferences } from '../lib/preferences'
 import { modeLabels } from '../lib/types'
+import { Readiness } from './Readiness'
+import { ModelRuntime } from './ModelRuntime'
+import { DataOverview } from './DataPrivacy'
 
 interface ServerSettings {
   models: Record<'reasoning' | 'coding' | 'vision' | 'security', string>
@@ -61,6 +64,7 @@ const sections = [
   { id: 'personalization', label: 'Personalisasi', icon: UserRound },
   { id: 'models', label: 'Model & inferensi', icon: Cpu },
   { id: 'connection', label: 'Koneksi', icon: Plug },
+  { id: 'readiness', label: 'Kesehatan & iPhone', icon: ShieldCheck },
   { id: 'data', label: 'Kontrol data', icon: Database },
   { id: 'privacy', label: 'Privasi & keamanan', icon: ShieldCheck },
   { id: 'shortcuts', label: 'Pintasan', icon: Keyboard },
@@ -116,11 +120,13 @@ export function Settings({
   onClose,
   onDisconnect,
   onExport,
+  onRecoveryExport,
   onImport,
   onArchiveAll,
   onClearAll,
   counts,
-  disabled
+  disabled,
+  exportDisabled
 }: {
   preferences: Preferences
   setPreferences: Dispatch<SetStateAction<Preferences>>
@@ -128,11 +134,13 @@ export function Settings({
   onClose: () => void
   onDisconnect: () => void
   onExport: () => void
+  onRecoveryExport: () => void
   onImport: (file: File) => Promise<void>
   onArchiveAll: () => void
   onClearAll: () => Promise<void>
   counts: { chats: number; projects: number; messages: number }
   disabled: boolean
+  exportDisabled: boolean
 }): JSX.Element {
   const [section, setSection] = useState('general')
   const [server, setServer] = useState<SettingsInfo | null>(null)
@@ -216,7 +224,7 @@ export function Settings({
     if (confirm === 'delete') {
       await onClearAll()
       setFeedback(
-        'Percakapan dan project pada perangkat ini dihapus beserta lampiran yang dirujuk.'
+        'Percakapan dan project pada perangkat ini dihapus. Referensi lampiran tidak lagi ditampilkan.'
       )
     }
     if (confirm === 'usage') {
@@ -265,6 +273,7 @@ export function Settings({
                   models:
                     'Konfigurasi backend bersama; perubahan berlaku untuk semua klien yang terhubung.',
                   connection: 'Periksa layanan backend, model lokal, dan sesi akses Anda.',
+                  readiness: 'Periksa kesiapan layanan dan akses privat iPhone.',
                   data: 'Kelola riwayat perangkat dan statistik backend dengan cakupan yang jelas.',
                   privacy: 'Informasi penyimpanan, retensi, dan batas akses agent.',
                   shortcuts: 'Akses fitur yang sering dipakai langsung dari keyboard.',
@@ -461,14 +470,15 @@ export function Settings({
                 </small>
               </label>
               <p className="notice">
-                Instruksi project ditambahkan saat chat berada dalam project. Percakapan lain dalam
-                project tidak otomatis menjadi konteks. Model lokal mungkin tidak selalu mengikuti
+                Instruksi dan memori project ditambahkan saat chat berada dalam project. Percakapan
+                lain dalam project tidak otomatis menjadi konteks. Model lokal mungkin tidak selalu mengikuti
                 semua preferensi.
               </p>
             </>
           )}
           {section === 'models' && (
             <>
+              <ModelRuntime />
               {backendError && (
                 <p role="alert" className="notice error">
                   {backendError}
@@ -630,6 +640,7 @@ export function Settings({
               )}
             </>
           )}
+          {section === 'readiness' && <Readiness />}
           {section === 'connection' && (
             <>
               <div className="connection-card">
@@ -709,6 +720,7 @@ export function Settings({
           )}
           {section === 'data' && (
             <>
+              <DataOverview />
               <div className="data-summary">
                 <div>
                   <strong>{counts.chats}</strong>
@@ -727,14 +739,26 @@ export function Settings({
                 title="Ekspor data"
                 description="Unduh chat, project, dan preferensi sebagai JSON. Lampiran dan token akses tidak disertakan."
               >
-                <button className="secondary-button" disabled={disabled} onClick={onExport}>
+                <button className="secondary-button" disabled={exportDisabled} onClick={onExport}>
                   <Download size={15} />
                   Ekspor
                 </button>
               </Row>
               <Row
+                title="Snapshot browser untuk pemulihan"
+                description="Simpan ID chat, project, dan referensi lampiran untuk digabungkan dengan cadangan backend. Berkas ini berisi data pribadi."
+              >
+                <button
+                  className="secondary-button"
+                  disabled={exportDisabled}
+                  onClick={onRecoveryExport}
+                >
+                  <Download size={15} /> Snapshot browser
+                </button>
+              </Row>
+              <Row
                 title="Impor data"
-                description="Gabungkan cadangan Jo Workspace tanpa menimpa percakapan lama. Lampiran perlu diunggah ulang."
+                description="Gabungkan ekspor JSON atau pulihkan snapshot browser. Snapshot mempertahankan ID dan memerlukan backend yang sesuai."
               >
                 <button
                   className="secondary-button"
@@ -755,7 +779,7 @@ export function Settings({
                       void run(async () => {
                         await onImport(file)
                         setFeedback(
-                          'Cadangan berhasil digabungkan. Preferensi perangkat saat ini tetap digunakan.'
+                          'Berkas berhasil diimpor. Snapshot pemulihan juga mengembalikan preferensi perangkat.'
                         )
                       })
                     e.target.value = ''
@@ -776,7 +800,7 @@ export function Settings({
               </Row>
               <Row
                 title="Hapus seluruh chat & project"
-                description="Hapus data pada perangkat ini dan lampiran backend yang dirujuk chat tersebut."
+                description="Hapus chat dan project dari workspace bersama. Lampiran yang tidak lagi dirujuk mengikuti batas retensi backend."
               >
                 <button
                   className="danger-button"

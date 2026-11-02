@@ -2,6 +2,9 @@ import { useEffect, useRef, useState } from 'react'
 import type { JSX } from 'react'
 import ReactMarkdown from 'react-markdown'
 import type { Message } from '../lib/types'
+import { coverageNotes, orderedSources } from '../lib/citations'
+import { ProposalReview } from './ProposalReview'
+import { OutboundCard, OutboundLogLine } from './DataPrivacy'
 import { RemoteImage } from './RemoteImage'
 
 export function MessageImage({
@@ -61,7 +64,7 @@ export function MessageDetails({
   onOpenSecurity
 }: {
   message: Message
-  onProposal: (id: string, approve: boolean) => Promise<void>
+  onProposal: (id: string, approve: boolean, hunks?: number[]) => Promise<void>
   onAction: (id: string, approve: boolean, sessionTokens?: string[]) => Promise<void>
   onOpenSecurity?: (engagementId: string) => void
 }): JSX.Element {
@@ -87,6 +90,7 @@ export function MessageDetails({
           <strong>Konfirmasi rencana</strong>
           <p>{message.action.summary}</p>
           <p>Target: {message.action.target}</p>
+          {message.action.outbound && <OutboundCard info={message.action.outbound} />}
           {!!message.action.ports?.length && <p>Port: {message.action.ports.join(', ')}</p>}
           {message.action.environment && <p>Lingkungan: {message.action.environment}</p>}
           {!!message.action.account_refs?.length && (
@@ -151,18 +155,22 @@ export function MessageDetails({
         </section>
       )}
       {message.coverage && (
-        <p className="text-xs text-amber-200">
-          {message.coverage.complete
-            ? 'Seluruh bagian sumber tersedia untuk jawaban ini.'
-            : `Cakupan terbatas: ${message.coverage.selected}/${message.coverage.total} bagian. Jawaban ini bukan pemeriksaan seluruh dokumen.`}
-        </p>
+        <ul className="coverage-notes" aria-label="Cakupan dokumen">
+          {coverageNotes(message.coverage, !!message.content).map(([tone, text]) => (
+            <li key={text} className={tone}>
+              {text}
+            </li>
+          ))}
+        </ul>
       )}
       {!!message.sources?.length && (
         <details>
           <summary className="cursor-pointer text-xs text-emerald-300">
-            Sumber yang digunakan ({message.sources.length})
+            Sumber yang digunakan ({message.sources.length}
+            {message.coverage?.cited !== undefined && `, ${message.coverage.cited} dirujuk jawaban`}
+            )
           </summary>
-          {message.sources.map((s, i) => (
+          {orderedSources(message.sources).map((s, i) => (
             <div key={i} className="my-2 rounded bg-slate-950 p-3 text-xs">
               {s.kind === 'web' && s.url ? (
                 <a
@@ -174,7 +182,18 @@ export function MessageDetails({
                   {s.label} {s.title || s.url}
                 </a>
               ) : (
-                <strong>{s.label}</strong>
+                <div className="source-head">
+                  <strong>
+                    {s.filename ? `${s.filename} · ${s.location || s.label}` : s.label}
+                  </strong>
+                  {s.section !== undefined && (
+                    <span className="source-chip">bagian {s.section}</span>
+                  )}
+                  {s.cited && <span className="source-chip cited">Dirujuk jawaban</span>}
+                  {s.matched === false && (
+                    <span className="source-chip">Tanpa kata kunci pertanyaan</span>
+                  )}
+                </div>
               )}
               {s.kind === 'web' && (
                 <p className="mt-1 text-slate-400">
@@ -218,36 +237,20 @@ export function MessageDetails({
           ))}
         </div>
       )}
-      {message.proposals?.map((proposal) => (
-        <div key={proposal.id} className="rounded border border-amber-400/40 p-3">
-          <p>Usulan perubahan: {proposal.path}</p>
-          <pre className="my-2 max-h-72 overflow-auto whitespace-pre-wrap text-xs">
-            {proposal.diff}
-          </pre>
-          {proposal.state ? (
-            <p>{proposal.state === 'applied' ? 'Perubahan diterapkan.' : 'Usulan ditolak.'}</p>
-          ) : (
-            <div className="flex gap-3">
-              {[true, false].map((approve) => (
-                <button
-                  key={String(approve)}
-                  disabled={!!busy}
-                  className="rounded border px-3 py-1"
-                  onClick={() => {
-                    setBusy(proposal.id)
-                    setError('')
-                    void onProposal(proposal.id, approve)
-                      .catch((e) => setError(e.message))
-                      .finally(() => setBusy(''))
-                  }}
-                >
-                  {approve ? 'Setujui dan terapkan' : 'Tolak'}
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
-      ))}
+      {message.outbound && <OutboundLogLine log={message.outbound} />}
+      {!!message.proposals?.length && (
+        <ProposalReview
+          proposals={message.proposals}
+          busy={busy}
+          onDecide={(id, approve, hunks) => {
+            setBusy(id)
+            setError('')
+            void onProposal(id, approve, hunks)
+              .catch((e) => setError(e.message))
+              .finally(() => setBusy(''))
+          }}
+        />
+      )}
       {error && (
         <p role="alert" className="text-rose-300">
           {error}

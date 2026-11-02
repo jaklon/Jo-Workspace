@@ -3,10 +3,10 @@ import { build } from '../desktop-app/node_modules/esbuild/lib/main.js'
 import { fileURLToPath } from 'node:url'
 
 async function moduleAt(path) {
-  const result = await build({ entryPoints: [fileURLToPath(new URL(path, import.meta.url))], bundle: true, platform: 'node', format: 'esm', write: false })
+  const result = await build({ entryPoints: [fileURLToPath(new URL(path, import.meta.url))], bundle: true, platform: 'node', format: 'esm', write: false, define: { 'import.meta.env.VITE_API_BASE_URL': '"http://localhost"' } })
   return import('data:text/javascript;base64,' + Buffer.from(result.outputFiles[0].text).toString('base64'))
 }
-const { exportBackup, importBackup } = await moduleAt('../desktop-app/src/renderer/src/lib/backup.ts')
+const { exportBackup, importBackup, exportRecoverySnapshot, importRecoverySnapshot } = await moduleAt('../desktop-app/src/renderer/src/lib/backup.ts')
 const { defaultPreferences, normalizePreferences, personalizedPrompt } = await moduleAt('../desktop-app/src/renderer/src/lib/preferences.ts')
 const { createSession, validate, TAB_TYPES } = await moduleAt('../desktop-app/src/renderer/src/lib/sessions.ts')
 const projects = [{ id: 'project-original', name: 'Client work', instructions: 'Use TypeScript', createdAt: 1 }]
@@ -24,6 +24,17 @@ assert.equal(restored.sessions.chat[0].pinned, true)
 assert.equal(restored.sessions.chat[0].archived, true)
 assert.equal(restored.sessions.chat[0].messages[0].content, 'Saved answer')
 assert.deepEqual(restored.sessions.chat[0].attachments, [])
+const activeSessions = Object.fromEntries(TAB_TYPES.map(tab => [tab, sessions[tab][0].id]))
+const recovery = importRecoverySnapshot(exportRecoverySnapshot(sessions, activeSessions, projects, defaultPreferences))
+assert.equal(recovery.projects[0].id, projects[0].id)
+assert.equal(recovery.sessions.chat[0].id, sessions.chat[0].id)
+assert.equal(recovery.sessions.chat[0].projectId, projects[0].id)
+assert.equal(recovery.sessions.chat[0].attachments[0].id, 'private-attachment')
+assert.equal(recovery.sessions.chat[0].messages[0].proposals, undefined)
+assert.equal(recovery.sessions.chat[0].messages[0].image, undefined)
+const tamperedRecovery = JSON.parse(exportRecoverySnapshot(sessions, activeSessions, projects, defaultPreferences))
+tamperedRecovery.sessions.chat[0].projectId = 'missing-project'
+assert.throws(() => importRecoverySnapshot(JSON.stringify(tamperedRecovery)))
 assert.throws(() => importBackup('{"format":"other"}'))
 const malformed = JSON.parse(backup)
 malformed.sessions.chat[0].messages = [{ role: 'system', content: 'Unsafe imported role' }]
@@ -37,4 +48,4 @@ assert.equal(validate({ sessions: { chat: {} } }).sessions.chat.length, 1)
 assert.equal(normalizePreferences({ theme: 'invalid', sendWithEnter: 'false' }).theme, 'dark')
 assert.equal(normalizePreferences({ sendWithEnter: false }).sendWithEnter, false)
 assert.match(personalizedPrompt('Hello', { ...defaultPreferences, responseLanguage: 'en', customInstructions: 'Use examples' }, 'Project context'), /Answer in English[\s\S]*Use examples[\s\S]*Project context[\s\S]*Hello/)
-console.log('20 workspace assertions passed: backup safety, project remapping, migration, validation, and personalized prompts.')
+console.log('Workspace assertions passed: backup safety, recovery IDs, project remapping, migration, validation, and personalized prompts.')

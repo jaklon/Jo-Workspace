@@ -26,6 +26,7 @@ from openpyxl import Workbook
 import tools
 from config import MAX_BODY
 from contracts import ChatPayload
+from chat_orchestrator import Intent
 from doc_engine import parse_document_file
 from main import app
 from model_runtime import ModelRuntime, ThinkSplitter, bounded_messages, clean_answer
@@ -70,6 +71,28 @@ class FileBoundaryTests(unittest.TestCase):
         self.assertEqual(file.read_text(), "after\n")
         self.assertEqual(next((self.root / ".agent-backups").glob("*.bak")).read_text(), "before\n")
 
+    def test_proposal_hunks_apply_selectively_with_risk_summary(self):
+        file = self.root / "settings.yaml"
+        original = "".join(f"line {i}\n" for i in range(1, 31))
+        file.write_bytes(original.encode())
+        changed = original.replace("line 2\n", "line 2 edited\n").replace("line 28\n", "line 28 edited\n")
+        proposal = tools.proposal_payload("settings.yaml", changed)
+        self.assertEqual(len(proposal["hunks"]), 2)
+        self.assertEqual(proposal["review"]["added"], 2)
+        self.assertEqual(proposal["review"]["removed"], 2)
+        self.assertTrue(any("konfigurasi" in risk for risk in proposal["review"]["risks"]))
+        tools.apply_proposal(proposal, [1])
+        result = file.read_bytes().decode()
+        self.assertIn("line 28 edited", result)
+        self.assertNotIn("line 2 edited", result)
+        self.assertEqual(result.count("\n"), 30)
+        with self.assertRaises(ValueError):
+            tools.apply_proposal(tools.proposal_payload("settings.yaml", changed), [5])
+        new_file = tools.proposal_payload("baru.py", "print(1)\n")
+        self.assertTrue(new_file["review"]["new_file"])
+        with self.assertRaises(ValueError):
+            tools.apply_proposal(new_file, [0])
+
     def test_stale_proposal_does_not_overwrite(self):
         file = self.root / "example.txt"
         file.write_text("before")
@@ -113,6 +136,41 @@ class DocumentTests(unittest.TestCase):
         self.assertIn("ZEBRA-842", context)
         self.assertFalse(coverage["complete"])
         self.assertTrue(any(source["line_start"] > 1000 for source in sources))
+
+    def test_sources_carry_readable_locations_and_citations(self):
+        from router import mark_citations
+        pdf = {"id": "p", "name": "laporan.pdf", "content":
+               "[Halaman 1]\nPendahuluan.\n\n[Halaman 2 tidak terbaca: tidak ada lapisan teks, perlu OCR]\n\n[Halaman 3]\nAnggaran: Rp 40 juta."}
+        docx = {"id": "d", "name": "notulen.docx", "content": "[Paragraf 1] Rapat dibuka.\n[Tabel 2, baris 1] Vendor | CENDANA"}
+        context, sources, coverage = retrieve([pdf, docx], "Berapa anggaran?", "Gunakan sumber.")
+        labels = {s["label"] for s in sources}
+        self.assertIn("[laporan.pdf · hal. 3 · bagian 3]", labels)
+        self.assertTrue(any("Tabel 2, baris 1" in s["location"] for s in sources))
+        self.assertEqual(coverage["unreadable_pages"], [2])
+        self.assertIn("tidak terbaca", context)
+        self.assertEqual(coverage["matched"], 1)
+        marked, cov = mark_citations("Anggaran Rp 40 juta [laporan.pdf · hal. 3 · bagian 3].", sources, coverage)
+        self.assertEqual([s["section"] for s in marked if s["cited"]], [3])
+        self.assertEqual(cov["cited"], 1)
+        _, missing = retrieve([docx], "Siapa auditor eksternal?", "Gunakan sumber.")[1:]
+        self.assertEqual(missing["matched"], 0)
+
+    def test_partially_scanned_pdf_keeps_readable_pages(self):
+        class Page:
+            def __init__(self, text):
+                self.text = text
+            def extract_text(self):
+                return self.text
+        class Reader:
+            is_encrypted = False
+            def __init__(self, pages):
+                self.pages = [Page(t) for t in pages]
+        with patch("doc_engine.PdfReader", lambda _: Reader(["Halaman berisi teks", ""])):
+            text = parse_document_file("scan.pdf", b"%PDF-1.4")
+        self.assertIn("Halaman berisi teks", text)
+        self.assertIn("[Halaman 2 tidak terbaca", text)
+        with patch("doc_engine.PdfReader", lambda _: Reader(["", " "])), self.assertRaises(ValueError):
+            parse_document_file("blank.pdf", b"%PDF-1.4")
 
     def test_budget_rejects_instead_of_silent_prompt_truncation(self):
         with self.assertRaises(ValueError):
@@ -286,13 +344,28 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(self.events(response)[-1]["type"], "done")
             self.assertEqual(chat.await_args.args[0], "chosen:latest")
 
+    def test_router_decides_whether_chat_spends_thinking_tokens(self):
+        for reasoning, expected in ((False, [False]), (True, [True])):
+            calls = []
+            async def chunks(model, messages, **kwargs):
+                calls.append(kwargs.get("think"))
+                yield {"message": {"content": "391"}}
+                yield {"done": True}
+            with self.subTest(reasoning=reasoning), \
+                 patch("main.classify", new=AsyncMock(return_value=Intent(intent="chat", reasoning=reasoning))), \
+                 patch("main.runtime.chunks", new=chunks):
+                response = self.client.post("/api/chat", headers=self.headers,
+                    json={"prompt": "Berapa 17 x 23?", "session_id": "think-route", "unified": True, "history": []})
+                self.assertEqual(self.events(response)[-1]['type'], 'done')
+                self.assertEqual(calls, expected)
+
     def test_chat_session_history_reaches_model_and_does_not_cross_sessions(self):
         captured = []
         async def chunks(model, messages, **kwargs):
             captured.append(messages)
             yield {"message": {"content": "Jawaban."}}
             yield {"done": True}
-        with patch("main.classify", new=AsyncMock(return_value="chat")), \
+        with patch("main.classify", new=AsyncMock(return_value=Intent(intent="chat", reasoning=False))), \
              patch("main.runtime.chunks", new=chunks):
             previous = [{"role":"user", "content":"Kode proyek saya MERANTI-842."},
                         {"role":"assistant", "content":"Saya mencatat kode itu."}]
@@ -304,7 +377,7 @@ class ApiTests(unittest.TestCase):
         self.assertFalse(any('MERANTI-842' in message['content'] for message in captured[1]))
 
     def test_unified_coding_waits_for_confirmation_and_rejects_replay(self):
-        with patch("main.classify", new=AsyncMock(return_value="coding")), \
+        with patch("main.classify", new=AsyncMock(return_value=Intent(intent="coding", reasoning=False))), \
              patch("main.execute_agent_pipeline", new=AsyncMock(return_value={"result": "done", "proposals": []})) as agent:
             response = self.client.post("/api/chat", headers=self.headers,
                 json={"prompt": "Periksa file workspace", "session_id": "unified-test", "unified": True})
@@ -332,7 +405,7 @@ class ApiTests(unittest.TestCase):
                   "observations": [{"statement": "Port 443 tertutup.", "evidence_quote": "closed"},
                                    {"statement": "Nginx 1.24 rentan.", "evidence_quote": "nginx/1.24"}],
                   "limitations": ["Fixture sintetis"], "recommendations": ["Aktifkan HSTS."]}
-        with patch("main.classify", new=AsyncMock(return_value="security")), \
+        with patch("main.classify", new=AsyncMock(return_value=Intent(intent="security", reasoning=False))), \
              patch("main.security_slots", new=AsyncMock(return_value=slots)), \
              patch("bounded_scan.run_scan", new=AsyncMock(return_value=fake_result)) as scanner, \
              patch("deep_analysis.installed_models", new=AsyncMock(return_value=[{"name": "security-test", "digest": "synthetic"}])), \
@@ -363,7 +436,7 @@ class ApiTests(unittest.TestCase):
         async def chunks(model, messages, **kwargs):
             yield {"message": {"content": "Hasil sintetis"}}
             yield {"done": True}
-        with patch("main.classify", new=AsyncMock(return_value="web")), \
+        with patch("main.classify", new=AsyncMock(return_value=Intent(intent="web", reasoning=False))), \
              patch("main.web_context", new=AsyncMock(return_value=web)) as search, \
              patch("main.runtime.chunks", new=chunks):
             response = self.client.post("/api/chat", headers=self.headers,
@@ -382,7 +455,7 @@ class ApiTests(unittest.TestCase):
             ToolSelection(tool="tcp-connect", target="192.0.2.4", ports=[443]),
             ToolSelection(tool="http-head", target="https://example.test/")])
         output = {"summary": "Selesai", "observations": ["Observasi"], "limitations": ["Fixture"], "recommendations": []}
-        with patch("main.classify", new=AsyncMock(return_value="security")), \
+        with patch("main.classify", new=AsyncMock(return_value=Intent(intent="security", reasoning=False))), \
              patch("main.security_slots", new=AsyncMock(return_value=slots)), \
              patch("bounded_scan.run_scan", new=AsyncMock(return_value={"tool":"tcp-connect", "ports":[]})) as scanner, \
              patch("web_checks.probe", new=AsyncMock(return_value={"http_status":200})) as web, \
@@ -411,7 +484,7 @@ class ApiTests(unittest.TestCase):
             if kwargs.get("format_schema") == SecuritySlots.model_json_schema():
                 return {"content": json.dumps({"tool":"unsupported"}), "tool_calls": []}
             return {"content":json.dumps(output), "tool_calls":[]}
-        with patch("main.classify", new=AsyncMock(return_value="security")), \
+        with patch("main.classify", new=AsyncMock(return_value=Intent(intent="security", reasoning=False))), \
              patch("chat_orchestrator.runtime.chat", new=AsyncMock(side_effect=model_chat)), \
              patch("bounded_scan.run_scan", new=AsyncMock(return_value={"tool":"inventory-html", "candidates":[]})) as scanner, \
              patch("web_checks.probe", new=AsyncMock(return_value={"http_status":200})) as web, \
@@ -449,7 +522,7 @@ class ApiTests(unittest.TestCase):
                 attachment = self.client.app.state.store.add_attachment(session, "fixture.txt", "document", "example configuration")
                 slots = SecuritySlots(tool="document-review", target="example.test", environment="lab",
                                       assessment_mode=mode, evidence_kind=kind, test_account_ref=alias)
-                with patch("main.classify", new=AsyncMock(return_value="security")), \
+                with patch("main.classify", new=AsyncMock(return_value=Intent(intent="security", reasoning=False))), \
                      patch("main.security_slots", new=AsyncMock(return_value=slots)), \
                      patch("deep_analysis.installed_models", new=AsyncMock(return_value=[{"name": "security-test", "digest": "synthetic"}])), \
                      patch("deep_analysis.runtime.chat", new=AsyncMock(return_value={"content": json.dumps(output), "tool_calls": []})), \
@@ -478,7 +551,7 @@ class ApiTests(unittest.TestCase):
         output = {"summary": "Spesialis selesai", "observations": ["Bukti dibaca"],
                   "limitations": ["Tidak ada koneksi baru"], "recommendations": []}
         models = [{"name": "security-test:latest", "digest": "synthetic"}]
-        with patch("main.classify", new=AsyncMock(return_value="security")), \
+        with patch("main.classify", new=AsyncMock(return_value=Intent(intent="security", reasoning=False))), \
              patch("main.security_slots", new=AsyncMock(return_value=slots)), \
              patch("deep_analysis.installed_models", new=AsyncMock(return_value=models)), \
              patch("security_agents.installed_models", new=AsyncMock(return_value=models)), \
@@ -506,7 +579,7 @@ class ApiTests(unittest.TestCase):
         slots = SecuritySlots(tool="monitoring-local", target="127.0.0.1", environment="lab", assessment_mode="whitebox")
         result = {"tool":"monitoring-local", "target":"127.0.0.1", "services":[]}
         output = {"summary":"Snapshot selesai", "observations":["Data sintetis"], "limitations":["Fixture"], "recommendations":[]}
-        with patch("main.classify", new=AsyncMock(return_value="security")), \
+        with patch("main.classify", new=AsyncMock(return_value=Intent(intent="security", reasoning=False))), \
              patch("main.security_slots", new=AsyncMock(return_value=slots)), \
              patch("local_monitoring.snapshot", new=AsyncMock(return_value=result)) as monitoring, \
              patch("deep_analysis.installed_models", new=AsyncMock(return_value=[{"name":"security-test", "digest":"synthetic"}])), \
@@ -535,7 +608,7 @@ class ApiTests(unittest.TestCase):
         observed = [{"http_status":401,"redirect_observed":False}, {"http_status":200,"redirect_observed":False},
                     {"http_status":403,"redirect_observed":False}]
         output = {"summary":"Analisis selesai", "observations":["Status diamati"], "limitations":["Fixture"], "recommendations":[]}
-        with patch("main.classify", new=AsyncMock(return_value="security")), \
+        with patch("main.classify", new=AsyncMock(return_value=Intent(intent="security", reasoning=False))), \
              patch("main.security_slots", new=AsyncMock(return_value=slots)), \
              patch("web_checks.probe", new=AsyncMock(side_effect=observed)) as probe, \
              patch("deep_analysis.installed_models", new=AsyncMock(return_value=[{"name":"security-test", "digest":"synthetic"}])), \
@@ -637,7 +710,7 @@ class ApiTests(unittest.TestCase):
                             'url': 'https://example.com/story', 'text': 'Cuplikan'}],
                'images': [{'url': 'https://example.com/image.png', 'alt': 'Foto',
                            'source_url': 'https://example.com/story'}], 'coverage': None}
-        with patch('main.web_context', new=AsyncMock(return_value=web)), patch('main.classify', new=AsyncMock(return_value='web')):
+        with patch('main.web_context', new=AsyncMock(return_value=web)), patch('main.classify', new=AsyncMock(return_value=Intent(intent="web", reasoning=False))):
             with patch('main.runtime.chunks', new=chunks):
                 response = self.client.post('/api/chat', headers=self.headers,
                     json={'prompt': 'Cari gambar', 'web_mode': 'on', 'unified':True, 'session_id':'web-citations'})

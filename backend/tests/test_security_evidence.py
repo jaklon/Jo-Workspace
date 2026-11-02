@@ -61,6 +61,28 @@ class EvidenceApiTests(unittest.TestCase):
     def report(self, **changes):
         return self.post('/reports',{'title':'QA report','summary':'Local fixture assessment.','actor_label':'Declared local author','acknowledge':True,**changes})
 
+    def test_readable_report_summarises_confidence_follow_up_and_retest_changes(self):
+        e = self.evidence()
+        first_finding = self.finding([e['id']])
+        first = self.report(title='Pemeriksaan awal')
+        self.assertIsNone(first['view']['comparison'])
+        self.assertEqual(first['view']['unreviewed'][0]['confidence'], 'Rendah')
+        self.review(first_finding)
+        self.finding([e['id']], title='Cookie tanpa Secure')
+        second = self.report(title='Pemeriksaan ulang')
+        view = second['view']
+        self.assertIn('1 masalah tervalidasi masih terbuka', view['owner_summary']['headline'])
+        self.assertEqual(view['reviewed'][0]['confidence'], 'Tinggi')
+        self.assertIn('retest', view['follow_ups'][0]['action'])
+        self.assertEqual(view['comparison']['new'], ['Cookie tanpa Secure'])
+        self.assertEqual(view['comparison']['changed'][0]['to'], 'Tervalidasi, belum diperbaiki')
+        text = second['readable_markdown']
+        for heading in ('Ringkasan untuk pemilik sistem', 'Perbandingan dengan laporan sebelumnya', 'Temuan yang telah direview',
+                        'Kandidat belum direview', 'Keterbatasan pemeriksaan', 'Tindak lanjut', 'Lampiran teknis'):
+            self.assertIn(heading, text)
+        # The earlier report keeps comparing against nothing; snapshots stay immutable.
+        self.assertIsNone(self.get('/reports/'+first['snapshot']['id'])['view']['comparison'])
+
     def test_offline_evidence_provenance_hash_and_immutable_api(self):
         with patch('socket.getaddrinfo') as dns, patch('socket.create_connection') as network, patch('subprocess.Popen') as process, patch('main.assess') as scanner:
             e = self.evidence('offline_policy')

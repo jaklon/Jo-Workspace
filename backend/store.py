@@ -61,7 +61,8 @@ class Store:
             if db.execute("SELECT COUNT(*) FROM proposals WHERE state='pending'").fetchone()[0] >= 100:
                 raise ValueError("Terlalu banyak proposal tertunda.")
             db.execute("INSERT INTO proposals(id,session,payload,created) VALUES (?,?,?,?)", (proposal_id, session, json.dumps(payload), time.time()))
-        return {"id": proposal_id, "path": payload["path"], "diff": payload["diff"]}
+        return {"id": proposal_id, "path": payload["path"], "diff": payload["diff"],
+                "hunks": payload.get("hunks", []), "review": payload.get("review")}
 
     def propose_chat_action(self, session, payload):
         action_id = secrets.token_urlsafe(18)
