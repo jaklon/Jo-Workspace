@@ -538,7 +538,7 @@ async def chat_endpoint(payload: ChatPayload, request: Request):
             if not answer or answer.lower().startswith("thinking process"):
                 raise ValueError("Model tidak menghasilkan jawaban akhir.")
             if web:
-                answer = linked_answer(answer, sources)
+                answer = linked_answer(answer, sources, web.get("notice", ""))
             elif coverage:
                 sources, coverage = mark_citations(answer, sources, coverage)
             yield wire(event("result", result=answer, sources=sources, coverage=coverage, images=images,
@@ -608,7 +608,7 @@ async def confirm_chat_action(action_id: str, payload: ChatActionDecision, reque
                 if not answer:
                     raise ValueError("Model tidak menghasilkan jawaban akhir.")
                 images = [{**item, 'ticket': image_ticket(request.state.api_token, item['url'], int(time.time()) + 900)} for item in web['images']]
-                yield wire(event("result", result=linked_answer(answer, web["sources"]), sources=web["sources"], images=images,
+                yield wire(event("result", result=linked_answer(answer, web["sources"], web.get("notice", "")), sources=web["sources"], images=images,
                                  outbound=web.get("outbound")))
             elif action["intent"] == "attachment":
                 yield wire(event("result", result="Lampiran disetujui; siap diproses."))

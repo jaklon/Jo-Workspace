@@ -49,6 +49,27 @@ class ChatWebTests(unittest.IsolatedAsyncioTestCase):
         fetch.assert_not_awaited()
         self.assertIn('[1](https://one.example/a)', linked_answer('Jawaban', context['sources']))
 
+    async def test_unindexed_host_gets_url_check_notice(self):
+        # Searching for a bare domain the engines do not index returns unrelated
+        # sources; the answer must then point to the URL-reading flow.
+        results = {'results': [
+            {'url': 'https://www.zhihu.com/question/1', 'title': 'WhatsApp', 'snippet': 'x' * 200, 'image_url': None},
+            {'url': 'https://jascon.com/', 'title': 'Ship', 'snippet': 'y' * 200, 'image_url': None},
+        ]}
+        with patch('chat_web.query', new=AsyncMock(return_value=results)), \
+             patch('chat_web.get_public', new=AsyncMock(side_effect=Exception('blocked'))):
+            context = await web_context('deep analysis jascon.my.id', 'on', 'model')
+        self.assertIn('jascon.my.id', context['notice'])
+        self.assertIn('Pemeriksaan URL', context['notice'])
+        answer = linked_answer('Tidak ditemukan.', context['sources'], context['notice'])
+        self.assertIn('Deep Analisis', answer)
+        # A search that does surface the host adds no notice.
+        hit = {'results': [{'url': 'https://jascon.my.id/about', 'title': 'Jascon', 'snippet': 'z' * 200, 'image_url': None}]}
+        with patch('chat_web.query', new=AsyncMock(return_value=hit)), \
+             patch('chat_web.get_public', new=AsyncMock(side_effect=Exception('blocked'))):
+            context = await web_context('deep analysis jascon.my.id', 'on', 'model')
+        self.assertEqual(context['notice'], '')
+
     def test_page_text_ignores_navigation_and_scripts(self):
         html = b'<html><body><nav>Ignore</nav><main><h1>Title</h1><script>secret</script><p>Body text</p></main></body></html>'
         text = page_text(html)
