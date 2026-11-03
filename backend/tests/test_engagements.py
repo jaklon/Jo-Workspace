@@ -194,5 +194,95 @@ class EngagementApiTests(unittest.TestCase):
         self.assertFalse(self.client.get("/api/pentest/capabilities", headers=self.headers).json()["execution_enabled"])
 
 
+class ApprovalThresholdTests(unittest.TestCase):
+    """Dynamic approval threshold classification and dry-run blast-radius."""
+    def test_tiers_follow_action_and_intrusive_tool_override(self):
+        from auto_governance import classify_risk
+        self.assertEqual(classify_risk("passive_recon", "subfinder-passive")["tier"], "low")
+        self.assertEqual(classify_risk("configuration_review")["tier"], "low")
+        self.assertEqual(classify_risk("tcp_discovery", "tcp-connect")["tier"], "medium")
+        self.assertEqual(classify_risk("http_headers", "http-head")["tier"], "medium")
+        # An intrusive scanner lifts an otherwise-medium header check to high.
+        nuclei = classify_risk("http_headers", "nuclei-head")
+        self.assertEqual(nuclei["tier"], "high")
+        self.assertEqual(nuclei["requires"], "session_pin")
+        self.assertEqual(classify_risk("active_reflection", "active-reflection")["requires"], "session_pin")
+        # Unknown actions fail safe to the strictest tier.
+        self.assertEqual(classify_risk("anything-else")["tier"], "high")
+        self.assertFalse(classify_risk("http_headers")["auto_execute"])
+        self.assertTrue(classify_risk("passive_recon")["auto_execute"])
+
+    def test_plan_risk_takes_the_highest_tier(self):
+        from auto_governance import plan_risk, require_pin
+        plan = {"jobs": [{"action": "tcp_discovery", "tool": "tcp-connect"},
+                         {"action": "http_headers", "tool": "zap-head"}]}
+        self.assertEqual(plan_risk(plan)["tier"], "high")
+        self.assertTrue(require_pin(plan))
+        passive = {"jobs": [{"action": "passive_recon", "tool": "subfinder-passive"}]}
+        self.assertFalse(require_pin(passive))
+
+    def test_blast_radius_scales_with_volume_breadth_and_environment(self):
+        from auto_governance import simulate_plan
+        light = simulate_plan({"environment": "lab", "jobs": [
+            {"tool": "http-head", "action": "http_headers", "target": {"kind": "url", "value": "https://example.test/"}, "ports": [443], "timeout": 20}]})
+        heavy = simulate_plan({"environment": "production_readonly", "jobs": [
+            {"tool": "zap-head", "action": "http_headers", "target": {"kind": "cidr", "value": "10.0.0.0/24"}, "ports": [443], "timeout": 180, "max_concurrency": 1}]})
+        self.assertEqual(light["total_requests"], 1)
+        self.assertLess(light["blast_radius"], heavy["blast_radius"])
+        self.assertEqual(heavy["risk_tier"], "high")
+        self.assertTrue(heavy["requires_pin"])
+        self.assertLessEqual(heavy["blast_radius"], 100)
+
+
+class GovernanceApiTests(unittest.TestCase):
+    setUp = EngagementApiTests.setUp
+    tearDown = EngagementApiTests.tearDown
+    create = EngagementApiTests.create
+
+    def test_risk_classification_endpoint(self):
+        low = self.client.post("/api/security/risk-classification", headers=self.headers, json={"action": "passive_recon"})
+        self.assertEqual(low.status_code, 200, low.text)
+        self.assertEqual(low.json()["tier"], "low")
+        high = self.client.post("/api/security/risk-classification", headers=self.headers, json={"action": "http_headers", "tool": "nuclei-head"}).json()
+        self.assertEqual(high["tier"], "high")
+        self.assertFalse(high["execution_enabled"])
+        self.assertEqual(self.client.post("/api/security/risk-classification", json={"action": "http_headers"}).status_code, 401)
+
+    def test_approval_pin_gate_for_high_tier(self):
+        token = os.environ["AGENT_API_TOKEN"]
+        base = "/api/security/approval/verify"
+        # Low tier needs no PIN and verifies trivially.
+        low = self.client.post(base, headers=self.headers, json={"action": "passive_recon", "session_pin": ""}).json()
+        self.assertTrue(low["verified"])
+        self.assertFalse(low["pin_required"])
+        # High tier requires the correct local session PIN.
+        good = self.client.post(base, headers=self.headers, json={"action": "scoped_spider", "session_pin": token}).json()
+        self.assertTrue(good["pin_required"])
+        self.assertTrue(good["verified"])
+        bad = self.client.post(base, headers=self.headers, json={"action": "scoped_spider", "session_pin": "wrong-pin"}).json()
+        self.assertFalse(bad["verified"])
+        empty = self.client.post(base, headers=self.headers, json={"action": "scoped_spider", "session_pin": ""}).json()
+        self.assertFalse(empty["verified"])
+
+    def test_plan_simulation_endpoint(self):
+        body = {"environment": "lab", "jobs": [{"action": "http_headers", "tool": "http-head",
+                "target": {"kind": "url", "value": "https://example.test/"}, "ports": [], "max_concurrency": 1, "max_duration_minutes": 1}]}
+        response = self.client.post("/api/security/plan-simulation", headers=self.headers, json=body)
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()
+        self.assertEqual(data["total_requests"], 1)
+        self.assertEqual(data["risk_tier"], "medium")
+        self.assertFalse(data["execution_enabled"])
+        self.assertGreaterEqual(data["blast_radius"], 0)
+
+    def test_scope_violations_start_empty_and_require_auth(self):
+        row = self.create()
+        path = self.base + "/" + row["id"] + "/scope-violations"
+        response = self.client.get(path, headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"items": [], "total": 0, "execution_enabled": False})
+        self.assertEqual(self.client.get(path).status_code, 401)
+
+
 if __name__ == "__main__":
     unittest.main()

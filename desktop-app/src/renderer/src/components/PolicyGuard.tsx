@@ -1,5 +1,5 @@
 import { useEffect, useState, type JSX, type ReactNode } from 'react'
-import { ShieldCheck, Download } from 'lucide-react'
+import { ShieldCheck, Download, Lock, Gauge } from 'lucide-react'
 import { apiFetch } from '../lib/api'
 import {
   actionLabels,
@@ -11,11 +11,15 @@ import {
 } from '../lib/engagements'
 import { downloadFile } from '../lib/preferences'
 import {
+  classifyRisk,
   policyDecisionLabel,
+  riskRequirementLabel,
   scopeFingerprint,
+  type PlanSimulation,
   type PolicyResult,
   type ScopeReport
 } from '../lib/policy'
+import { DryRunPanel } from './ProposalReview'
 
 export function ScopeFindings({ report }: { report: ScopeReport }): JSX.Element {
   return (
@@ -132,7 +136,12 @@ export function PolicyGuard({ engagement }: { engagement: Engagement }): JSX.Ele
   const [total, setTotal] = useState(0)
   const [historyError, setHistoryError] = useState('')
   const [refresh, setRefresh] = useState(0)
-  const path = engagementPath(engagement.project_id, engagement.id) + '/policy-checks'
+  const [pin, setPin] = useState('')
+  const [simulation, setSimulation] = useState<PlanSimulation | null>(null)
+  const [simBusy, setSimBusy] = useState(false)
+  const risk = classifyRisk(action)
+  const base = engagementPath(engagement.project_id, engagement.id)
+  const path = base + '/policy-checks'
   const fingerprint = JSON.stringify([
     kind,
     target,
@@ -145,6 +154,8 @@ export function PolicyGuard({ engagement }: { engagement: Engagement }): JSX.Ele
     engagement.revision
   ])
   const visibleResult = resultInput === fingerprint ? result : null
+  const [simInput, setSimInput] = useState('')
+  const visibleSim = simInput === fingerprint ? simulation : null
   useEffect(() => {
     const controller = new AbortController()
     void apiFetch(path, { signal: controller.signal })
@@ -172,6 +183,10 @@ export function PolicyGuard({ engagement }: { engagement: Engagement }): JSX.Ele
         Hasil lolos hanya berlaku pada saat evaluasi dan tidak memberikan izin eksekusi. Target nama
         untuk tindakan jaringan tetap ditolak sampai DNS/pinning terpercaya tersedia.
       </p>
+      <div className={`approval-tier approval-tier-${risk.tier}`} role="status">
+        <strong>Ambang persetujuan: {risk.label}</strong>
+        <span>{riskRequirementLabel[risk.requires]}</span>
+      </div>
       <form
         onSubmit={async (e) => {
           e.preventDefault()
@@ -179,6 +194,20 @@ export function PolicyGuard({ engagement }: { engagement: Engagement }): JSX.Ele
           setError('')
           setResult(null)
           try {
+            // Dynamic approval threshold: intrusive (high) actions need an
+            // explicit confirmation backed by the local session PIN before the
+            // proposal is even evaluated. Low/medium tiers skip this gate.
+            if (risk.requires === 'session_pin') {
+              if (!pin.trim()) throw new Error('Masukkan PIN/kata sandi sesi lokal untuk tindakan intrusif.')
+              const verify = await (
+                await apiFetch(base + '/approval/verify', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ action, session_pin: pin })
+                })
+              ).json()
+              if (!verify.verified) throw new Error('PIN sesi lokal tidak cocok; evaluasi tindakan intrusif dibatalkan.')
+            }
             const proposal = {
               expected_revision: engagement.revision,
               roe_version: head.version,
@@ -284,12 +313,76 @@ export function PolicyGuard({ engagement }: { engagement: Engagement }): JSX.Ele
                 ))}
               </select>
             </Field>
+            {risk.requires === 'session_pin' && (
+              <Field name="PIN / kata sandi sesi lokal">
+                <input
+                  type="password"
+                  autoComplete="off"
+                  value={pin}
+                  placeholder="Wajib untuk tindakan intrusif"
+                  onChange={(e) => setPin(e.target.value)}
+                />
+              </Field>
+            )}
           </div>
-          <button className="primary-button" type="submit" disabled={total >= 500}>
-            {busy ? 'Mengevaluasi…' : 'Evaluasi policy tanpa eksekusi'}
-          </button>
+          {risk.requires === 'session_pin' && (
+            <p className="notice">
+              <Lock size={13} /> Tindakan intrusif (pemindaian aktif, fuzzing, review terautentikasi)
+              memerlukan konfirmasi eksplisit dengan PIN sesi lokal sebelum dievaluasi.
+            </p>
+          )}
+          <div className="policy-guard-actions">
+            <button
+              className="primary-button"
+              type="submit"
+              disabled={total >= 500 || (risk.requires === 'session_pin' && !pin.trim())}
+            >
+              {busy ? 'Mengevaluasi…' : 'Evaluasi policy tanpa eksekusi'}
+            </button>
+            <button
+              className="secondary-button"
+              type="button"
+              disabled={simBusy || !target.trim()}
+              onClick={async () => {
+                setSimBusy(true)
+                setError('')
+                try {
+                  const data = await (
+                    await apiFetch(base + '/plan-simulation', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        environment: head.content.environment,
+                        jobs: [
+                          {
+                            action,
+                            target: { kind, value: target.trim() },
+                            ports: parsePorts(ports),
+                            max_concurrency: concurrency,
+                            max_duration_minutes: duration
+                          }
+                        ]
+                      })
+                    })
+                  ).json()
+                  setSimulation(data)
+                  setSimInput(fingerprint)
+                } catch (e) {
+                  setError(e instanceof Error ? e.message : 'Simulasi gagal.')
+                } finally {
+                  setSimBusy(false)
+                }
+              }}
+            >
+              <Gauge size={14} /> {simBusy ? 'Menyimulasi…' : 'Simulasikan beban (dry-run)'}
+            </button>
+          </div>
         </fieldset>
       </form>
+      {visibleSim && <DryRunPanel simulation={visibleSim} />}
+      {simulation && !visibleSim && (
+        <p role="status">Input berubah; jalankan simulasi lagi untuk estimasi terbaru.</p>
+      )}
       {error && (
         <p className="policy-fail" role="alert">
           {error}

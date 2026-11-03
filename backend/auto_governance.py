@@ -175,6 +175,131 @@ def adapter_plan(plan):
     return step, web, scan
 
 
+# --- Dynamic approval threshold -------------------------------------------
+# Passive/offline work runs without interruption; bounded network checks need
+# one explicit approval; active scanners (Nuclei/ZAP), spidering, reflection,
+# authenticated review and fuzzing need an explicit confirmation backed by the
+# local session PIN. Unknown actions fail safe to the strictest tier.
+PASSIVE_ACTIONS = {"passive_recon", "configuration_review", "document_review", "monitoring_read"}
+MEDIUM_ACTIONS = {"tcp_discovery", "http_headers", "unauthenticated_access_check", "service_inventory"}
+HIGH_ACTIONS = {"scoped_spider", "active_reflection", "authenticated_api_review"}
+INTRUSIVE_TOOLS = {"nuclei-head", "zap-head", "scoped-spider", "active-reflection", "auth-two-session"}
+TIER_LABELS = {"low": "Low / pasif", "medium": "Medium", "high": "High / intrusif"}
+TIER_ORDER = {"low": 0, "medium": 1, "high": 2}
+
+
+def classify_risk(action, tool=""):
+    """Map one action/tool to an approval tier and the confirmation it needs."""
+    if tool in INTRUSIVE_TOOLS or action in HIGH_ACTIONS:
+        tier, requires = "high", "session_pin"
+    elif action in MEDIUM_ACTIONS:
+        tier, requires = "medium", "one_click"
+    elif action in PASSIVE_ACTIONS:
+        tier, requires = "low", "auto"
+    else:
+        tier, requires = "high", "session_pin"
+    return {"tier": tier, "requires": requires, "action": action, "tool": tool,
+            "label": TIER_LABELS[tier], "auto_execute": tier == "low"}
+
+
+def plan_risk(plan):
+    """Highest tier across every job in a (possibly multi-tool) plan."""
+    jobs = plan.get("jobs") or [plan]
+    classes = [classify_risk(job.get("action", ""), job.get("tool", "")) for job in jobs]
+    top = max(classes, key=lambda item: TIER_ORDER[item["tier"]])
+    return {**top, "per_job": classes, "requires_pin": top["tier"] == "high"}
+
+
+def require_pin(plan):
+    return plan_risk(plan)["requires_pin"]
+
+
+# --- Dry-run blast-radius simulator ---------------------------------------
+# Deterministic projection of the load a plan would place on a target before it
+# runs: estimated HTTP requests, concurrency, wall-clock duration and a 0–100
+# blast-radius score. No network, no DNS — the adapters pace one request per
+# second, so request count is the primary driver of time and exposure.
+TOOL_REQUESTS = {
+    "http-head": 1, "nuclei-head": 1, "zap-head": 1, "auth-unauthenticated-get": 1,
+    "inventory-html": 1, "js-bundle-inventory": 1, "auth-two-session": 3,
+    "scoped-spider": 20, "active-reflection": 6, "monitoring-local": 2,
+    "subfinder-passive": 0, "amass-passive": 0, "document-review": 0,
+}
+TOOL_BASE_SCORE = {
+    "document-review": 2, "monitoring-local": 5, "subfinder-passive": 8, "amass-passive": 12,
+    "http-head": 18, "inventory-html": 20, "js-bundle-inventory": 22, "auth-unauthenticated-get": 24,
+    "tcp-connect": 30, "nmap": 34, "auth-two-session": 48, "scoped-spider": 62,
+    "active-reflection": 66, "nuclei-head": 72, "zap-head": 80,
+}
+ENVIRONMENT_WEIGHT = {"lab": 0.5, "development": 0.75, "staging": 1.0, "uat": 1.0, "production_readonly": 1.4}
+
+
+def _address_count(target):
+    value = (target or {}).get("value", "")
+    kind = (target or {}).get("kind", "")
+    if kind == "cidr":
+        try:
+            return ipaddress.ip_network(value, strict=False).num_addresses
+        except ValueError:
+            return 1
+    return 1
+
+
+def _estimated_requests(tool, ports, action):
+    if tool in ("tcp-connect", "nmap"):
+        return max(1, len(ports or []))
+    if tool in TOOL_REQUESTS:
+        return TOOL_REQUESTS[tool]
+    # Fall back on the action when no concrete tool is named (policy preview).
+    return {"tcp_discovery": max(1, len(ports or [])), "passive_recon": 0,
+            "configuration_review": 0, "document_review": 0, "monitoring_read": 2}.get(action, 1)
+
+
+def blast_radius(*, base, requests, addresses, concurrency, environment):
+    """Bounded 0–100 score combining tool intrusiveness, request volume,
+    target breadth, concurrency and the environment's sensitivity."""
+    import math
+    volume = min(30, requests * 1.5)
+    breadth = min(25, math.log2(max(1, addresses)) * 3)
+    parallel = min(10, (max(1, concurrency) - 1) * 5)
+    raw = (base + volume + breadth + parallel) * ENVIRONMENT_WEIGHT.get(environment, 1.0)
+    return max(0, min(100, round(raw)))
+
+
+def _job_simulation(job, environment):
+    tool = job.get("tool", "")
+    action = job.get("action", "")
+    ports = job.get("ports") or []
+    requests = _estimated_requests(tool, ports, action)
+    addresses = _address_count(job.get("target"))
+    concurrency = job.get("max_concurrency", 1)
+    # Adapters pace ~1 request/second; add a fixed handshake/overhead allowance.
+    paced = requests * max(1, concurrency ** 0)  # requests are serialized at 1 rps
+    estimated_seconds = min(job.get("timeout", 60), 4 + paced)
+    score = blast_radius(base=TOOL_BASE_SCORE.get(tool, 40), requests=requests,
+                         addresses=addresses, concurrency=concurrency, environment=environment)
+    risk = classify_risk(action, tool)
+    return {"tool": tool or action or "unknown", "action": action, "target": (job.get("target") or {}).get("value", ""),
+            "estimated_requests": requests, "target_addresses": addresses, "concurrency": concurrency,
+            "estimated_seconds": estimated_seconds, "blast_radius": score, "risk_tier": risk["tier"],
+            "passive": requests == 0}
+
+
+def simulate_plan(plan):
+    """Projected load for a prepared plan or a single job, for a dry-run panel."""
+    environment = plan.get("environment", "lab")
+    jobs = plan.get("jobs") or [plan]
+    sims = [_job_simulation(job, environment) for job in jobs]
+    risk = plan_risk(plan)
+    return {"environment": environment, "jobs": sims, "job_count": len(sims),
+            "total_requests": sum(item["estimated_requests"] for item in sims),
+            "max_concurrency": max((item["concurrency"] for item in sims), default=1),
+            "estimated_seconds": sum(item["estimated_seconds"] for item in sims),
+            "blast_radius": max((item["blast_radius"] for item in sims), default=0),
+            "risk_tier": risk["tier"], "risk_label": risk["label"], "requires": risk["requires"],
+            "requires_pin": risk["requires_pin"], "execution_enabled": False}
+
+
 def create_approved_jobs(state, project_id, session_id, plan, session_tokens=None):
     project = str(UUID(project_id))
     now = utc_now()
@@ -208,10 +333,12 @@ def create_approved_jobs(state, project_id, session_id, plan, session_tokens=Non
                 expected_revision=engagement["revision"], action=decision, actor_label="operator sesi lokal",
                 note="Persetujuan lokal atas rencana yang ditampilkan di chat; bukan verifikasi izin pihak ketiga.", acknowledge=True))
         engagement, head = state.engagements.head(db, project, eid)
+        risk = plan_risk(plan)
+        gate_note = f"Gate dibuka berdasarkan konfirmasi chat. Tingkat risiko rencana: {risk['label']} (perlu {risk['requires']})."
         db.execute("INSERT INTO security_engagement_gates VALUES (?,0,1,?,?,?)",
-                   (eid, now.isoformat(), "operator sesi lokal", "Gate dibuka berdasarkan konfirmasi chat."))
+                   (eid, now.isoformat(), "operator sesi lokal", gate_note))
         state.engagements.event(db, eid, head["version"], "gate_opened", "operator sesi lokal",
-                                "Gate dibuka berdasarkan konfirmasi chat.", head["content_hash"])
+                                gate_note, head["content_hash"])
         ids = []
         for item, (step, web, scan) in zip(plans, adapters):
             payload = CreateJob(expected_roe_revision=engagement["revision"], roe_version=head["version"],

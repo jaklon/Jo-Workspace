@@ -17,7 +17,7 @@ from fastapi import HTTPException
 from pydantic import Field, StrictBool
 from engagements import StrictModel, EngagementContent, utc_now
 from pentest import nmap_path
-from security_policy import evaluate
+from security_policy import evaluate, ScopeDriftError
 
 
 class ScanBinding(StrictModel):
@@ -317,6 +317,9 @@ class ScanRunner:
                 row,plan=self.live(db,owner,jid)
                 _,head=self.jobs.engagements.head(db,row['project_id'],row['engagement_id'])
                 exclusions=EngagementContent.model_validate_json(head['content']).out_of_scope
+            from web_checks import drift_interceptor
+            await drift_interceptor(self.jobs.engagements,row['project_id'],row['engagement_id'],
+                                    plan['steps'][0]['target'],'scan:'+plan['scan']['tool'])
             sessions=self.jobs.sessions.take(jid) if plan['scan']['tool']=='auth-two-session' else None
             if plan['scan']['tool'] in ('scoped-spider','active-reflection','js-bundle-inventory'):
                 task=asyncio.create_task(run_scan(plan,guard,exclusions,target_guard=target_guard))
@@ -339,6 +342,8 @@ class ScanRunner:
                 db.execute('UPDATE security_jobs SET output_bytes=output_bytes+? WHERE id=?',(len(raw.encode()),jid))
                 self.jobs.finish(db,row,'completed',message='Run adapter disetujui selesai; evidence tersimpan.')
         except asyncio.CancelledError:raise
+        except ScopeDriftError:
+            self.jobs.fail(owner,jid,'SCAN_SCOPE_DRIFT','Target di luar scope terdeteksi sebelum eksekusi; scan dihentikan dan pelanggaran dicatat.')
         except Exception as exc:
             self.jobs.fail(owner,jid,'SCAN_FAILED',type(exc).__name__+': scan dihentikan; periksa RoE, tool dan batas run.')
         finally:

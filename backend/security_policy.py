@@ -4,7 +4,7 @@ import ipaddress
 import json
 import re
 from datetime import timedelta
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 POLICY_VERSION = "scope-policy-2.0"
 NETWORK_ACTIONS = {"tcp_discovery", "http_headers", "unauthenticated_access_check", "service_inventory", "scoped_spider", "active_reflection", "authenticated_api_review", "monitoring_read", "passive_recon"}
@@ -181,3 +181,184 @@ def evaluate(content, head, engagement, proposal, now, dns_pinning=False):
             "revision": engagement["revision"], "roe_version": head["version"], "content_hash": head["content_hash"],
             "proposal": normalized, "proposal_hash": digest, "scope_report": report, "execution_enabled": False,
             "execution_blockers": ["STAGE_2_PLANNING_ONLY"], "grants_execution": False}
+
+
+# --- Real-time scope-drift interceptor -------------------------------------
+# A hard-blocking guard that runs immediately before a tool is executed. It
+# extracts every target from a tool's argument payload, then reuses the pure
+# scope relations above to verify each one against the active in-scope list and
+# exclusions. DNS resolution is I/O, so it stays out of this module: callers
+# resolve names themselves (a fast getaddrinfo in the adapter layer) and pass
+# the results in via `resolved`, keeping this module free of sockets so its
+# offline determinism and test guarantees hold.
+DRIFT_POLICY_VERSION = "scope-drift-1.0"
+_IPV4 = r"(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)"
+_URL_RE = re.compile(r"https?://[^\s\"'<>\\)}]+", re.I)
+_CIDR_RE = re.compile(r"(?<![\w.])" + _IPV4 + r"/(?:3[0-2]|[12]?\d)(?![\w.])")
+# Permissive: match any hex/colon run (incl. "::" compression and IPv4-mapped
+# tails); classify_target validates each candidate with ipaddress and drops the
+# non-addresses, so over-matching here is harmless.
+_IPV6_CIDR_RE = re.compile(r"(?<![\w:.])(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f.]{0,4}(?:/\d{1,3})?(?![\w:.])")
+_IPV4_RE = re.compile(r"(?<![\w.])" + _IPV4 + r"(?![\w.])")
+_DOMAIN_RE = re.compile(r"(?<![\w.-])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}(?![\w.-])", re.I)
+
+
+class ScopeDriftError(Exception):
+    """Raised to hard-block a tool call whose targets leave the approved scope."""
+    def __init__(self, report):
+        self.report = report
+        super().__init__(report.get("reason") or "SCOPE_DRIFT")
+
+
+class _Target:
+    __slots__ = ("kind", "value")
+
+    def __init__(self, kind, value):
+        self.kind, self.value = kind, value
+
+
+def classify_target(value):
+    """Return a normalized _Target for one candidate string, or None if it is
+    not a URL/IP/CIDR/domain the scope relations can reason about."""
+    value = value.strip().rstrip(".")
+    if not value:
+        return None
+    if _URL_RE.fullmatch(value) or value.lower().startswith(("http://", "https://")):
+        try:
+            parsed = urlsplit(value)
+            if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
+                return None
+            hostname = parsed.hostname
+            try:
+                ip = ipaddress.ip_address(hostname)
+                host_part = ("[" + str(ip) + "]") if ip.version == 6 else str(ip)
+            except ValueError:
+                host_part = _normalize_domain(hostname)
+                if host_part is None:
+                    return None
+            port = parsed.port
+            default = (parsed.scheme, port) in (("http", 80), ("https", 443))
+            netloc = host_part if port is None or default else f"{host_part}:{port}"
+            return _Target("url", urlunsplit((parsed.scheme, netloc, parsed.path or "/", "", "")))
+        except ValueError:
+            return None
+    if "/" in value:
+        try:
+            return _Target("cidr", str(ipaddress.ip_network(value, strict=False)))
+        except ValueError:
+            return None
+    try:
+        return _Target("ip", str(ipaddress.ip_address(value)))
+    except ValueError:
+        pass
+    normalized = _normalize_domain(value)
+    return _Target("domain", normalized) if normalized else None
+
+
+def _normalize_domain(value):
+    value = value.strip().rstrip(".")
+    if "_" in value or " " in value or "." not in value:
+        return None
+    try:
+        value = value.encode("idna").decode("ascii").lower()
+    except (UnicodeError, ValueError):
+        value = value.lower()
+    if len(value) > 253 or not all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in value.split(".")):
+        return None
+    return value
+
+
+def _collect_strings(payload, into, depth=0):
+    if depth > 12 or len(into) > 2000:
+        return
+    if isinstance(payload, str):
+        into.append(payload)
+    elif isinstance(payload, dict):
+        for key, item in payload.items():
+            if isinstance(key, str):
+                into.append(key)
+            _collect_strings(item, into, depth + 1)
+    elif isinstance(payload, (list, tuple, set)):
+        for item in payload:
+            _collect_strings(item, into, depth + 1)
+
+
+def _targets_in_text(text):
+    found = []
+    masked = text
+    for match in _URL_RE.finditer(text):
+        target = classify_target(match.group().rstrip(".,;:!?"))
+        if target:
+            found.append(target)
+        masked = masked[:match.start()] + " " * (match.end() - match.start()) + masked[match.end():]
+    for pattern, _kind in ((_CIDR_RE, "cidr"), (_IPV6_CIDR_RE, "ip"), (_IPV4_RE, "ip"), (_DOMAIN_RE, "domain")):
+        for match in pattern.finditer(masked):
+            target = classify_target(match.group())
+            if target:
+                found.append(target)
+            masked = masked[:match.start()] + " " * (match.end() - match.start()) + masked[match.end():]
+    return found
+
+
+def extract_targets(payload):
+    """Pull every distinct URL/IP/CIDR/domain out of an arbitrary tool-argument
+    payload (strings, dicts, lists), deduplicated and normalized."""
+    strings = []
+    _collect_strings(payload, strings)
+    seen, targets = set(), []
+    for text in strings:
+        for target in _targets_in_text(text):
+            key = (target.kind, target.value)
+            if key not in seen:
+                seen.add(key)
+                targets.append(target)
+    return targets
+
+
+def _violation(target, code, detail, resolved_ip=None):
+    entry = {"kind": target.kind, "value": target.value, "code": code, "detail": detail}
+    if resolved_ip is not None:
+        entry["resolved_ip"] = resolved_ip
+    return entry
+
+
+def scope_drift(targets, in_scope, out_of_scope, environment, resolved=None):
+    """Pure scope-drift evaluation. `resolved` maps a target hostname to the list
+    of IP strings it resolved to, so a name that is approved but points at a
+    forbidden or excluded network (DNS rebinding) is caught as well."""
+    resolved = resolved or {}
+    violations, checked = [], []
+    for target in targets:
+        entry = {"kind": target.kind, "value": target.value}
+        checked.append(entry)
+        problem = asset_problem(target, environment)
+        if problem:
+            violations.append(_violation(target, "BLOCKED_ADDRESS", problem))
+        if not any(contains(asset, target) for asset in in_scope):
+            violations.append(_violation(target, "OUT_OF_SCOPE", "Target tidak tercakup entri in-scope manapun."))
+        if any(overlaps(asset, target) for asset in out_of_scope):
+            violations.append(_violation(target, "EXCLUDED", "Target menyentuh daftar pengecualian."))
+        hostname = host(target)
+        for address in resolved.get(hostname, []) if hostname else []:
+            try:
+                ip = _Target("ip", str(ipaddress.ip_address(address)))
+            except ValueError:
+                violations.append(_violation(target, "DNS_INVALID", f"Resolusi mengembalikan alamat tidak valid: {address}", resolved_ip=address))
+                continue
+            problem = asset_problem(ip, environment)
+            if problem:
+                violations.append(_violation(target, "DNS_REBIND_BLOCKED", f"Nama ter-resolusi ke jaringan terlarang: {problem}", resolved_ip=ip.value))
+            if any(overlaps(asset, ip) for asset in out_of_scope):
+                violations.append(_violation(target, "DNS_REBIND_EXCLUDED", "Nama ter-resolusi ke alamat pada daftar pengecualian.", resolved_ip=ip.value))
+    return {"policy_version": DRIFT_POLICY_VERSION, "decision": "block" if violations else "allow",
+            "violations": violations, "checked": checked, "execution_enabled": False}
+
+
+def enforce_scope_drift(payload, in_scope, out_of_scope, environment, resolved=None):
+    """Extract targets from `payload` and raise ScopeDriftError if any drifts.
+    Returns the allow report (with the targets it cleared) when nothing drifts."""
+    report = scope_drift(extract_targets(payload), in_scope, out_of_scope, environment, resolved)
+    if report["decision"] == "block":
+        report["reason"] = report["violations"][0]["code"]
+        raise ScopeDriftError(report)
+    return report

@@ -44,7 +44,7 @@ from search_workspace import router as search_router, searx_url
 from data_privacy import outbound_security, outbound_web, storage_overview
 from chat_web import web_context, linked_answer, user_message
 from deep_analysis import router as deep_analysis_router, init as init_deep_analysis, chat_report
-from chat_orchestrator import classify, security_slots
+from chat_orchestrator import classify, security_slots, domain_disambiguation
 from auto_governance import prepare_plan, create_approved_jobs
 from security_jobs import Stop, Approval as JobApproval
 from deep_analysis import AnalysisRequest, analyze
@@ -412,6 +412,14 @@ async def chat_endpoint(payload: ChatPayload, request: Request):
             yield wire(event("status", step="queued", label="Menunggu giliran model"))
             reasoning = True
             if payload.unified:
+                # A bare domain in an analysis context (jascon.my.id, no scheme) is
+                # ambiguous and must not fall through to web search; offer the concrete
+                # URL-check / recon / stored-report commands instead.
+                hint = domain_disambiguation(user_message(payload.prompt)) if not payload.attachment_ids else None
+                if hint is not None:
+                    yield wire(event("result", result=hint, sources=[], coverage=None, images=[]))
+                    yield wire(event("done"))
+                    return
                 # A "deep analysis <url>" request returns the stored report, or the
                 # steps still needed. It must take priority over the router so it is
                 # never swallowed by web search or treated as a new scan.
@@ -538,7 +546,7 @@ async def chat_endpoint(payload: ChatPayload, request: Request):
             if not answer or answer.lower().startswith("thinking process"):
                 raise ValueError("Model tidak menghasilkan jawaban akhir.")
             if web:
-                answer = linked_answer(answer, sources)
+                answer = linked_answer(answer, sources, web.get("notice", ""))
             elif coverage:
                 sources, coverage = mark_citations(answer, sources, coverage)
             yield wire(event("result", result=answer, sources=sources, coverage=coverage, images=images,
@@ -608,7 +616,7 @@ async def confirm_chat_action(action_id: str, payload: ChatActionDecision, reque
                 if not answer:
                     raise ValueError("Model tidak menghasilkan jawaban akhir.")
                 images = [{**item, 'ticket': image_ticket(request.state.api_token, item['url'], int(time.time()) + 900)} for item in web['images']]
-                yield wire(event("result", result=linked_answer(answer, web["sources"]), sources=web["sources"], images=images,
+                yield wire(event("result", result=linked_answer(answer, web["sources"], web.get("notice", "")), sources=web["sources"], images=images,
                                  outbound=web.get("outbound")))
             elif action["intent"] == "attachment":
                 yield wire(event("result", result="Lampiran disetujui; siap diproses."))

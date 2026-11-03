@@ -8,7 +8,8 @@ from uuid import uuid4
 import test_engagements as fixtures
 complete_content = fixtures.complete_content
 from engagements import EngagementContent, EngagementStore, ScopeAsset, utc_now
-from security_policy import contains, overlaps, scope_report
+from security_policy import (contains, overlaps, scope_report, extract_targets,
+    classify_target, scope_drift, enforce_scope_drift, ScopeDriftError)
 
 
 def asset(kind, value):
@@ -47,6 +48,82 @@ class ScopeRelationsTests(unittest.TestCase):
         self.assertTrue(overlaps(asset('domain','example.test'), asset('url','https://example.test/admin')))
         self.assertFalse(overlaps(asset('url','https://example.test/public'), asset('url','https://example.test/admin')))
         self.assertFalse(overlaps(asset('url','https://example.test/admin'), asset('url','https://example.test/administer')))
+
+
+class ScopeDriftTests(unittest.TestCase):
+    """Real-time scope-drift interceptor: pure extraction + matching + rebinding."""
+    def in_scope(self):
+        return [asset('cidr', '10.10.0.0/24'), asset('domain', 'app.example.test'),
+                asset('url', 'https://api.example.test/v1')]
+
+    def out_of_scope(self):
+        return [asset('ip', '10.10.0.99'), asset('cidr', '10.10.0.240/28')]
+
+    def test_extracts_every_target_kind_from_arbitrary_payload(self):
+        payload = {'url': 'https://app.example.test/login', 'list': ['10.10.0.5, 2001:db8::1'],
+                   'cidr': 'range 10.10.0.0/28', 'note': 'proxy http://10.10.0.7:8080/x',
+                   'before': 'config_hardened', 'after': 'headers_present'}
+        found = {(t.kind, t.value) for t in extract_targets(payload)}
+        self.assertIn(('url', 'https://app.example.test/login'), found)
+        self.assertIn(('cidr', '10.10.0.0/28'), found)
+        self.assertIn(('ip', '10.10.0.5'), found)
+        self.assertIn(('ip', '2001:db8::1'), found)
+        self.assertIn(('url', 'http://10.10.0.7:8080/x'), found)
+        # Enum/config tokens that carry underscores are never mistaken for hosts,
+        # so the MCP fixture arguments never trip the interceptor.
+        self.assertNotIn('config_hardened', {value for _, value in found})
+        self.assertNotIn('headers_present', {value for _, value in found})
+
+    def test_in_scope_cidr_domain_and_url_pass(self):
+        targets = [classify_target('10.10.0.5'), classify_target('https://app.example.test/x'),
+                   classify_target('https://api.example.test/v1/users'), classify_target('10.10.0.128/26')]
+        report = scope_drift(targets, self.in_scope(), self.out_of_scope(), 'staging')
+        self.assertEqual(report['decision'], 'allow', report['violations'])
+
+    def test_out_of_scope_target_is_hard_blocked(self):
+        report = scope_drift([classify_target('192.168.1.10')], self.in_scope(), self.out_of_scope(), 'staging')
+        self.assertEqual(report['decision'], 'block')
+        self.assertEqual(report['violations'][0]['code'], 'OUT_OF_SCOPE')
+
+    def test_cidr_matching_contained_and_broader_range(self):
+        self.assertEqual(scope_drift([classify_target('10.10.0.192/27')], self.in_scope(), [], 'staging')['decision'], 'allow')
+        # A range broader than the in-scope /24 is not contained by it.
+        broad = scope_drift([classify_target('10.10.0.0/16')], self.in_scope(), [], 'staging')
+        self.assertEqual(broad['decision'], 'block')
+        self.assertIn('OUT_OF_SCOPE', [v['code'] for v in broad['violations']])
+
+    def test_exclusion_overrides_in_scope_for_ip_and_cidr(self):
+        report = scope_drift([classify_target('10.10.0.99'), classify_target('10.10.0.242')],
+                             self.in_scope(), self.out_of_scope(), 'staging')
+        self.assertEqual(report['decision'], 'block')
+        self.assertEqual([v['code'] for v in report['violations']], ['EXCLUDED', 'EXCLUDED'])
+
+    def test_forbidden_address_class_blocks_even_when_in_scope(self):
+        report = scope_drift([classify_target('169.254.169.254')], [asset('cidr', '169.254.0.0/16')], [], 'staging')
+        self.assertEqual(report['decision'], 'block')
+        self.assertIn('BLOCKED_ADDRESS', [v['code'] for v in report['violations']])
+
+    def test_dns_rebinding_to_forbidden_or_excluded_network(self):
+        in_scope = [asset('domain', 'app.example.test')]
+        out_of_scope = [asset('ip', '203.0.113.9')]
+        drifted = scope_drift([classify_target('https://app.example.test/')], in_scope, out_of_scope, 'staging',
+                              resolved={'app.example.test': ['169.254.169.254', '203.0.113.9', '198.51.100.7']})
+        codes = [v['code'] for v in drifted['violations']]
+        self.assertEqual(drifted['decision'], 'block')
+        self.assertIn('DNS_REBIND_BLOCKED', codes)
+        self.assertIn('DNS_REBIND_EXCLUDED', codes)
+        # A clean public resolution that is neither forbidden nor excluded passes.
+        clean = scope_drift([classify_target('https://app.example.test/')], in_scope, out_of_scope, 'staging',
+                            resolved={'app.example.test': ['198.51.100.7']})
+        self.assertEqual(clean['decision'], 'allow', clean['violations'])
+
+    def test_enforce_raises_scope_drift_error_and_allows_in_scope(self):
+        with self.assertRaises(ScopeDriftError) as caught:
+            enforce_scope_drift({'target': 'http://10.0.0.5/'}, self.in_scope(), self.out_of_scope(), 'staging')
+        self.assertEqual(caught.exception.report['decision'], 'block')
+        self.assertTrue(caught.exception.report['reason'])
+        allowed = enforce_scope_drift({'payload': 'scan 10.10.0.5'}, self.in_scope(), self.out_of_scope(), 'staging')
+        self.assertEqual(allowed['decision'], 'allow')
 
 
 # Reuse fixture helpers without inheriting/rerunning every stage 1 test.

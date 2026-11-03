@@ -1,5 +1,6 @@
 """Engagement/RoE and stage 2 offline policy checks. No scanner or model calls."""
 import hashlib
+import hmac
 import ipaddress
 import json
 import re
@@ -14,7 +15,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import StrictInt, StrictBool, AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
-from security_policy import POLICY_VERSION, scope_report, evaluate
+from security_policy import POLICY_VERSION, scope_report, evaluate, enforce_scope_drift, ScopeDriftError
 
 FORBIDDEN = ["DoS/DDoS dan stress testing", "Penghapusan atau modifikasi data/skema", "Pengambilan PII asli", "Eksekusi shell arbitrer"]
 ACTIONS = ["tcp_discovery", "http_headers", "unauthenticated_access_check", "service_inventory", "scoped_spider", "active_reflection", "configuration_review", "document_review", "authenticated_api_review", "monitoring_read", "passive_recon"]
@@ -190,6 +191,29 @@ class PolicyProposal(StrictModel):
         return EngagementContent.valid_ports(value)
 
 
+class SimulationStep(StrictModel):
+    tool: str = Field(default="", max_length=64)
+    action: str = Field(default="", max_length=64)
+    target: ScopeAsset
+    ports: list[StrictInt] = Field(default_factory=list, max_length=100)
+    max_concurrency: int = Field(default=1, ge=1, le=4, strict=True)
+    max_duration_minutes: int = Field(default=1, ge=1, le=240, strict=True)
+
+
+class SimulationRequest(StrictModel):
+    environment: Literal["lab", "development", "staging", "uat", "production_readonly"] = "lab"
+    jobs: list[SimulationStep] = Field(min_length=1, max_length=6)
+
+
+class RiskRequest(StrictModel):
+    action: str = Field(default="", max_length=64)
+    tool: str = Field(default="", max_length=64)
+
+
+class ApprovalVerify(RiskRequest):
+    session_pin: str = Field(default="", max_length=256)
+
+
 def snapshot(content):
     payload = json.dumps(content.model_dump(mode="json"), sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return payload, hashlib.sha256(payload.encode()).hexdigest()
@@ -208,6 +232,8 @@ class EngagementStore:
                 CREATE TABLE IF NOT EXISTS engagement_events (id INTEGER PRIMARY KEY, engagement_id TEXT NOT NULL REFERENCES engagements(id), version INTEGER NOT NULL, at TEXT NOT NULL, action TEXT NOT NULL, actor TEXT NOT NULL, note TEXT NOT NULL, content_hash TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS policy_checks (id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL REFERENCES engagements(id), at TEXT NOT NULL, result TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS policy_checks_engagement ON policy_checks(engagement_id,at);
+                CREATE TABLE IF NOT EXISTS scope_violations (id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL REFERENCES engagements(id), at TEXT NOT NULL, surface TEXT NOT NULL, reason TEXT NOT NULL, report TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS scope_violations_engagement ON scope_violations(engagement_id,at);
             """)
 
     def connect(self):
@@ -273,6 +299,32 @@ class EngagementStore:
             result["id"] = str(uuid4())
             db.execute("INSERT INTO policy_checks VALUES (?,?,?,?)", (result["id"], eid, result["evaluated_at"], json.dumps(result, ensure_ascii=False)))
         return result
+
+    def assert_in_scope(self, db, project_id, eid, payload, resolved=None):
+        """Scope-drift interceptor: extract every target from a tool-argument
+        payload and hard-block (ScopeDriftError) if any leaves the active approved
+        scope or a resolved name rebinds to a forbidden/excluded network. Pure —
+        does no logging and no DNS; callers resolve names and record violations."""
+        _, head = self.head(db, project_id, eid)
+        content = EngagementContent.model_validate_json(head["content"])
+        return enforce_scope_drift(payload, content.in_scope, content.out_of_scope, content.environment, resolved)
+
+    def record_scope_violation(self, eid, surface, report):
+        """Persist a blocked scope-drift attempt on its own connection so the audit
+        record survives the rollback of the transaction that was denied."""
+        with closing(self.connect()) as db:
+            db.execute("INSERT INTO scope_violations(id,engagement_id,at,surface,reason,report) VALUES (?,?,?,?,?,?)",
+                       (str(uuid4()), eid, utc_now().isoformat(), surface[:60], (report.get("reason") or "SCOPE_DRIFT")[:60], json.dumps(report, ensure_ascii=False)[:20000]))
+            db.commit()
+
+    def scope_violations(self, project_id, eid):
+        with closing(self.connect()) as db:
+            db.execute("BEGIN")
+            self.head(db, project_id, eid)
+            rows = [{**dict(row), "report": json.loads(row["report"])} for row in
+                    db.execute("SELECT id,at,surface,reason,report FROM scope_violations WHERE engagement_id=? ORDER BY at DESC,id DESC LIMIT 100", (eid,))]
+            total = db.execute("SELECT COUNT(*) FROM scope_violations WHERE engagement_id=?", (eid,)).fetchone()[0]
+        return {"items": rows, "total": total, "execution_enabled": False}
 
     def policy_history(self, project_id, eid, all_records=False):
         with closing(self.connect()) as db:
@@ -424,3 +476,35 @@ async def check_policy(project_id: UUID, engagement_id: UUID, payload: PolicyPro
 @router.get("/projects/{project_id}/engagements/{engagement_id}/policy-checks")
 async def policy_history(project_id: UUID, engagement_id: UUID, request: Request, all_records: bool = False):
     return request.app.state.engagements.policy_history(str(project_id), str(engagement_id), all_records=all_records)
+
+
+@router.get("/projects/{project_id}/engagements/{engagement_id}/scope-violations")
+async def scope_violations(project_id: UUID, engagement_id: UUID, request: Request):
+    return request.app.state.engagements.scope_violations(str(project_id), str(engagement_id))
+
+
+@router.post("/plan-simulation")
+async def plan_simulation(payload: SimulationRequest):
+    from auto_governance import simulate_plan
+    jobs = [{"tool": step.tool, "action": step.action, "target": step.target.model_dump(mode="json"),
+             "ports": step.ports, "max_concurrency": step.max_concurrency, "duration": step.max_duration_minutes,
+             "timeout": min(240, step.max_duration_minutes) * 60} for step in payload.jobs]
+    return {**simulate_plan({"environment": payload.environment, "jobs": jobs}), "approval_mode": "local_attestation"}
+
+
+@router.post("/risk-classification")
+async def risk_classification(payload: RiskRequest):
+    from auto_governance import classify_risk
+    return {**classify_risk(payload.action, payload.tool), "execution_enabled": False}
+
+
+@router.post("/approval/verify")
+async def approval_verify(payload: ApprovalVerify):
+    from auto_governance import classify_risk
+    from security import load_token
+    risk = classify_risk(payload.action, payload.tool)
+    if risk["requires"] != "session_pin":
+        # Low/medium tiers do not require a PIN; nothing to verify.
+        return {**risk, "verified": True, "pin_required": False, "execution_enabled": False}
+    verified = bool(payload.session_pin) and hmac.compare_digest(payload.session_pin, load_token())
+    return {**risk, "verified": verified, "pin_required": True, "execution_enabled": False}

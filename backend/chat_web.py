@@ -41,6 +41,41 @@ DIRECT_CUES = re.compile(r'^\s*(hai|halo|hello|terima kasih|thanks|tulis|buatkan
 USER_MARKER = "\n\nPesan pengguna:\n"
 
 
+def analyzed_host(prompt):
+    """A specific host the user named to look into, as a bare domain or explicit URL.
+
+    A bare domain (jascon.my.id) never matches URL_RE, so it falls into web search;
+    search engines do not index small sites, and the results are then about something
+    else entirely. This lets the caller detect that case and point the user at the
+    URL-reading flow instead."""
+    text = user_message(prompt)
+    url = URL_RE.search(text)
+    if url:
+        return (urlsplit(url.group(0).rstrip('.,);]')).hostname or "").lower()
+    # A dotted host token that is not an email address and not a plain sentence word.
+    match = re.search(r'(?<![\w@.-])((?:[a-z0-9-]+\.)+[a-z]{2,})(?![\w-])', text, re.I)
+    return match.group(1).lower() if match else ""
+
+
+def host_not_in_sources(host, sources):
+    if not host:
+        return False
+    for source in sources:
+        name = (urlsplit(source["url"]).hostname or "").lower()
+        if name == host or name.endswith("." + host) or host.endswith("." + name):
+            return False
+    return True
+
+
+def url_check_notice(host):
+    return (
+        f"\n\n> ℹ️ Catatan: Pencarian web memakai indeks mesin pencari, dan tidak ada "
+        f"sumber di atas yang berasal dari **{host}** — situs itu kemungkinan belum terindeks, "
+        f"jadi hasil ini bukan tentang situs tersebut (keberadaan domain tidak sama dengan terindeks). "
+        f"Untuk menganalisis {host} secara langsung, buka Security Workspace → Pemeriksaan URL "
+        f"(HEAD atau inventory-html untuk https://{host}), setujui run, lalu jalankan Deep Analisis.")
+
+
 def user_message(prompt):
     """The user's own words without the client's preference, project-instruction and memory prefix.
 
@@ -199,9 +234,14 @@ async def web_context(prompt, mode, model, history=()):
     messages = bounded_messages(WEB_SYSTEM, prompt, history, image_notice + '\n\n'.join(context), thinking=True, facts=True)
     # What actually left the device for this answer, shown with the result.
     outbound = {'query': plan['query'], 'pages': [row['url'] for row in rows if 'page_text' in row or row.get('fetch_error')]}
-    return {'messages': messages, 'sources': sources, 'images': images[:8], 'coverage': None, 'outbound': outbound}
+    # A bare domain/URL the user asked about that the search did not surface means the
+    # site is likely unindexed; steer them to the URL-reading flow instead of web search.
+    host = analyzed_host(prompt) if not plan['url'] else ''
+    notice = url_check_notice(host) if host_not_in_sources(host, sources) else ''
+    return {'messages': messages, 'sources': sources, 'images': images[:8], 'coverage': None,
+            'outbound': outbound, 'notice': notice}
 
 
-def linked_answer(answer, sources):
+def linked_answer(answer, sources, notice=''):
     links = ' · '.join(f"[{index}]({source['url']})" for index, source in enumerate(sources, 1))
-    return answer + '\n\nSumber web: ' + links
+    return answer + notice + '\n\nSumber web: ' + links
