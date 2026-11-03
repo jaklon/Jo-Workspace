@@ -30,6 +30,39 @@ def without_targets(text):
     return re.sub(r"(?<![\w.-])(?:[a-z0-9-]+\.)+[a-z]{2,}(?![\w.-])", " ", without_urls(text), flags=re.I)
 
 
+ANALYSIS_CUES = re.compile(
+    r"\b(deep\s+anal\w*|analis\w*|analy\w*|periksa|pemeriksaan|cek|check|scan|pindai|pentest|"
+    r"audit|inspeksi|inventar\w*|header|asesmen|assessment|kerentanan|keamanan|security|"
+    r"recon|subdomain|va)\b", re.I)
+BARE_DOMAIN = re.compile(r"(?<![\w@.-])((?:[a-z0-9-]+\.)+[a-z]{2,})(?![\w-])", re.I)
+
+
+def domain_disambiguation(user_text):
+    """A site named as a bare domain (no scheme) in an analysis context is ambiguous:
+    a URL check needs https://, passive recon takes the domain, and a stored report is
+    keyed by URL. Offer those concrete commands instead of letting the router guess web
+    search, which only reads search-engine indexes and misses small sites."""
+    if re.search(r"https?://", user_text, re.I) or re.search(r"\b(?:ip|domain)\s*:", user_text, re.I):
+        return None
+    if not ANALYSIS_CUES.search(without_targets(user_text)):
+        return None
+    # An explicitly named supported tool means the user already chose; let it proceed.
+    if any(name != "unsupported" and re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", user_text, re.I)
+           for name in ToolName.__args__):
+        return None
+    match = BARE_DOMAIN.search(user_text)
+    if not match:
+        return None
+    host = match.group(1).lower()
+    return (
+        f"Anda menyebut domain {host} tanpa skema, jadi belum ada yang dijalankan. Pilih yang Anda maksud:\n"
+        f"- Pemeriksaan URL (header/inventaris): http-head https://{host} staging blackbox\n"
+        f"- Recon subdomain pasif: subfinder-passive {host} staging blackbox\n"
+        f"- Lihat laporan Deep Analisis tersimpan: deep analysis https://{host}\n"
+        f"Ganti staging/blackbox sesuai lingkungan dan mode. Catatan: Cari web memakai indeks mesin "
+        f"pencari dan tidak membaca situs ini langsung, jadi untuk menganalisis situsnya gunakan perintah di atas.")
+
+
 def relevant_security_text(prompt, history):
     """Keep a new VA request independent of earlier targets and tool choices."""
     if VA_REQUEST.search(without_urls(prompt)):

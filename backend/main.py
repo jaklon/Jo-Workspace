@@ -44,7 +44,7 @@ from search_workspace import router as search_router, searx_url
 from data_privacy import outbound_security, outbound_web, storage_overview
 from chat_web import web_context, linked_answer, user_message
 from deep_analysis import router as deep_analysis_router, init as init_deep_analysis, chat_report
-from chat_orchestrator import classify, security_slots
+from chat_orchestrator import classify, security_slots, domain_disambiguation
 from auto_governance import prepare_plan, create_approved_jobs
 from security_jobs import Stop, Approval as JobApproval
 from deep_analysis import AnalysisRequest, analyze
@@ -412,6 +412,14 @@ async def chat_endpoint(payload: ChatPayload, request: Request):
             yield wire(event("status", step="queued", label="Menunggu giliran model"))
             reasoning = True
             if payload.unified:
+                # A bare domain in an analysis context (jascon.my.id, no scheme) is
+                # ambiguous and must not fall through to web search; offer the concrete
+                # URL-check / recon / stored-report commands instead.
+                hint = domain_disambiguation(user_message(payload.prompt)) if not payload.attachment_ids else None
+                if hint is not None:
+                    yield wire(event("result", result=hint, sources=[], coverage=None, images=[]))
+                    yield wire(event("done"))
+                    return
                 # A "deep analysis <url>" request returns the stored report, or the
                 # steps still needed. It must take priority over the router so it is
                 # never swallowed by web search or treated as a new scan.

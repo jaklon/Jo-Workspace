@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from auto_governance import create_approved_job, create_approved_jobs, prepare_plan
-from chat_orchestrator import VA_REQUEST, SecuritySlots, ToolSelection, complete_explicit_slots, security_slots, without_urls
+from chat_orchestrator import VA_REQUEST, SecuritySlots, ToolSelection, complete_explicit_slots, domain_disambiguation, security_slots, without_urls
 from contracts import HistoryMessage
 from deep_analysis import grounded_output
 from engagements import EngagementStore
@@ -40,6 +40,26 @@ class ChatActionTests(unittest.TestCase):
         plan, question = prepare_plan(slots)
         self.assertIsNone(question)
         self.assertEqual(plan["ports"], [22, 443])
+
+    def test_bare_domain_in_analysis_context_offers_concrete_commands(self):
+        # A bare domain with an analysis cue is ambiguous: offer URL check, recon and
+        # the stored-report command instead of guessing web search.
+        hint = domain_disambiguation('deep analysis jascon.my.id')
+        self.assertIsNotNone(hint)
+        self.assertIn('http-head https://jascon.my.id', hint)
+        self.assertIn('subfinder-passive jascon.my.id', hint)
+        self.assertIn('deep analysis https://jascon.my.id', hint)
+        self.assertIsNotNone(domain_disambiguation('cek keamanan example.co.id'))
+
+    def test_domain_disambiguation_stays_out_of_the_way(self):
+        # No trigger with an explicit URL, a qualified target, a named tool, no cue,
+        # or no domain at all.
+        self.assertIsNone(domain_disambiguation('deep analysis https://jascon.my.id'))
+        self.assertIsNone(domain_disambiguation('deep analysis domain:jascon.my.id'))
+        self.assertIsNone(domain_disambiguation('subfinder-passive jascon.my.id staging blackbox'))
+        self.assertIsNone(domain_disambiguation('cari berita terbaru tentang jascon.my.id'))
+        self.assertIsNone(domain_disambiguation('jelaskan apa itu REST API'))
+        self.assertIsNone(domain_disambiguation('cek keamanan akun saya'))
 
     def test_unsupported_tool_reply_guides_the_user(self):
         # A request the chat flow cannot turn into a check (e.g. "buatkan RoE")
