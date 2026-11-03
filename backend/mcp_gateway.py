@@ -11,7 +11,7 @@ from fastapi import APIRouter,HTTPException,Request
 from pydantic import Field,StrictBool,model_validator
 from engagements import StrictModel,EngagementContent,utc_now
 from security_jobs import encode,digest,LEASE_SECONDS,ACTIVE
-from security_policy import evaluate
+from security_policy import evaluate,ScopeDriftError
 from security_evidence import SafeValidationRoute,EvidenceInput,redactor
 from mcp_fixture_server import PROTOCOL,VERSION,TOOLS,FIXTURES,inspect_arguments
 from mcp_sandbox import SandboxRuntime,SandboxError,supported,exchange,sha_file
@@ -228,6 +228,9 @@ class MCPGateway:
         if digest(plan)!=row['plan_hash']:raise SandboxError('PLAN_INTEGRITY')
         self.jobs.open_gate(db,row['engagement_id']);self.validate(db,plan)
         engagement,head=self.engagements.head(db,row['project_id'],row['engagement_id'])
+        # Scope-drift interceptor: hard-block if any target hidden in the MCP tool
+        # arguments leaves the approved scope before the fixture is executed.
+        self.engagements.assert_in_scope(db,row['project_id'],row['engagement_id'],plan['mcp']['arguments'])
         policy=evaluate(EngagementContent.model_validate_json(head['content']),head,engagement,self.jobs.proposals(plan)[0],utc_now())
         if policy['decision']!='pass':raise SandboxError('POLICY_DENIED')
         db.execute('UPDATE security_job_worker SET expires_at=? WHERE id=1 AND owner=?',((utc_now()+timedelta(seconds=LEASE_SECONDS)).isoformat(),owner))
@@ -270,6 +273,13 @@ class MCPGateway:
                 self.jobs.event(db,jid,'mcp_fixture_completed',note='MCP fixture selesai dalam AppContainer; bukti otomatis tersimpan. Tidak ada pentest.')
                 self.jobs.finish(db,row,'completed')
         except asyncio.CancelledError:raise
+        except ScopeDriftError as drift:
+            try:
+                with closing(self.engagements.connect()) as audit:
+                    found=audit.execute('SELECT engagement_id FROM security_jobs WHERE id=?',(jid,)).fetchone()
+                if found:self.engagements.record_scope_violation(found['engagement_id'],'mcp_fixture',drift.report)
+            except Exception:pass
+            self.jobs.fail(owner,jid,'MCP_SCOPE_DRIFT','Target di luar scope terdeteksi sebelum eksekusi; fixture dihentikan dan pelanggaran dicatat.')
         except Exception as exc:
             code='MCP_OUTPUT_LIMIT' if 'OUTPUT_LIMIT' in str(exc) else 'MCP_POLICY_DENIED' if 'POLICY_DENIED' in str(exc) else 'MCP_GUARD_DENIED' if isinstance(exc,HTTPException) else 'MCP_RUNNER_FAILED'
             messages={'MCP_OUTPUT_LIMIT':'Output fixture melampaui anggaran; hasil policy sebelumnya dipertahankan.',

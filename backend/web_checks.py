@@ -13,9 +13,45 @@ from urllib.parse import urlsplit
 from fastapi import HTTPException
 from pydantic import Field
 from engagements import StrictModel, ScopeAsset, EngagementContent, utc_now
-from security_policy import evaluate, network
+from security_policy import evaluate, network, ScopeDriftError
 
 VERSION = 'public-head-1.0'
+
+
+async def scope_resolve(hostname, port):
+    """Best-effort fast DNS resolution for the scope-drift interceptor. Returns the
+    resolved IPs, or [] when the name cannot be resolved so the static scope
+    checks still apply without failing a legitimate run closed."""
+    try:
+        rows = await asyncio.wait_for(asyncio.get_running_loop().getaddrinfo(hostname, port or 443, type=socket.SOCK_STREAM), 3)
+        return sorted({row[4][0] for row in rows})
+    except (OSError, ValueError, TimeoutError):
+        return []
+
+
+async def drift_interceptor(engagements, project, eid, target, surface):
+    """Pre-execution scope-drift guard for scanning adapters: resolve the target's
+    name and hard-block (ScopeDriftError) before any tool runs if it leaves the
+    approved scope or rebinds to a forbidden/excluded network. The denial is
+    recorded on a separate connection so the audit survives the rolled-back run."""
+    hostname = urlsplit(target['value']).hostname if target.get('kind') == 'url' else (target.get('value') if target.get('kind') == 'domain' else None)
+    resolved = {}
+    if hostname:
+        try:
+            ipaddress.ip_address(hostname)
+        except ValueError:
+            addresses = await scope_resolve(hostname, 443)
+            if addresses:
+                resolved[hostname] = addresses
+    drift = None
+    try:
+        with engagements.transaction() as db:
+            engagements.assert_in_scope(db, project, eid, target, resolved)
+    except ScopeDriftError as exc:
+        drift = exc
+    if drift is not None:
+        engagements.record_scope_violation(eid, surface, drift.report)
+        raise drift
 
 
 class WebBinding(StrictModel):
@@ -216,6 +252,8 @@ class WebRunner:
         try:
             with self.jobs.engagements.transaction() as db:
                 row, plan, content = self.live(db, owner, jid)
+            await drift_interceptor(self.jobs.engagements, row['project_id'], row['engagement_id'],
+                                    plan['steps'][0]['target'], 'web:' + VERSION)
             pending = asyncio.create_task(probe(plan['steps'][0]['target']['value'], content.out_of_scope, guard))
             while not pending.done():
                 await asyncio.wait({pending}, timeout=0.25)
@@ -239,6 +277,8 @@ class WebRunner:
                 self.jobs.finish(db, row, 'completed', message='Pemeriksaan URL selesai; hasil memerlukan review analis.')
         except asyncio.CancelledError:
             raise
+        except ScopeDriftError:
+            self.jobs.fail(owner, jid, 'WEB_SCOPE_DRIFT', 'Target di luar scope terdeteksi sebelum eksekusi; pemeriksaan URL dihentikan dan pelanggaran dicatat.')
         except Exception as exc:
             code = 'TLS_VERIFICATION_FAILED' if isinstance(exc, ssl.SSLCertVerificationError) else 'WEB_CHECK_FAILED'
             self.jobs.fail(owner, jid, code, 'Pemeriksaan URL dihentikan: ' + type(exc).__name__ + '. Tidak ada retry, redirect, atau fallback TLS tidak aman.')

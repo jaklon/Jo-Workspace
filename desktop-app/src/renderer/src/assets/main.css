@@ -2661,6 +2661,137 @@ kbd {
   font-size: 13px;
   color: var(--muted);
 }
+/* --- Dynamic approval threshold + dry-run blast-radius --- */
+.approval-tier {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  font-size: 12px;
+}
+.approval-tier span {
+  color: var(--muted);
+}
+.approval-tier-low {
+  border-color: #3f8d5f;
+  background: color-mix(in srgb, #3f8d5f 12%, transparent);
+}
+.approval-tier-medium {
+  border-color: #c79a3a;
+  background: color-mix(in srgb, #c79a3a 14%, transparent);
+}
+.approval-tier-high {
+  border-color: #c7503a;
+  background: color-mix(in srgb, #c7503a 15%, transparent);
+}
+.policy-guard-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+.dry-run-panel {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--raised);
+  font-size: 12px;
+}
+.dry-run-panel header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.dry-run-panel header span {
+  margin-left: auto;
+}
+.blast-tier {
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  border: 1px solid var(--line);
+}
+.blast-tier-low {
+  color: #3f8d5f;
+  border-color: #3f8d5f;
+}
+.blast-tier-medium {
+  color: #c79a3a;
+  border-color: #c79a3a;
+}
+.blast-tier-high {
+  color: #e0735c;
+  border-color: #c7503a;
+}
+.dry-run-note {
+  margin: 6px 0;
+  color: var(--subtle);
+}
+.dry-run-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px;
+  margin: 8px 0;
+}
+.dry-run-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: var(--input);
+}
+.dry-run-metric b {
+  font-size: 15px;
+}
+.dry-run-metric span {
+  color: var(--subtle);
+  font-size: 11px;
+}
+.blast-meter {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--input);
+  overflow: hidden;
+}
+.blast-meter-fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.3s ease;
+}
+.blast-meter-fill.blast-tier-low {
+  background: #3f8d5f;
+}
+.blast-meter-fill.blast-tier-medium {
+  background: #c79a3a;
+}
+.blast-meter-fill.blast-tier-high {
+  background: #c7503a;
+}
+.dry-run-jobs {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 4px;
+}
+.dry-run-jobs li {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--input);
+}
+.dry-run-jobs small {
+  color: var(--subtle);
+}
 /* Settings text runs at 12px; keep the new panels on the same scale as setting rows. */
 .runtime-panel,
 .data-overview,

@@ -1,6 +1,63 @@
 import { useState, type JSX } from 'react'
-import { AlertTriangle, FileCode2, FilePlus2 } from 'lucide-react'
+import { AlertTriangle, FileCode2, FilePlus2, Gauge, Zap, Clock, Layers } from 'lucide-react'
 import type { Proposal } from '../lib/types'
+import { blastRadiusLabel, type PlanSimulation } from '../lib/policy'
+
+/** Dry-run blast-radius projection shown before the operator approves a run. */
+export function DryRunPanel({ simulation }: { simulation: PlanSimulation }): JSX.Element {
+  const score = Math.max(0, Math.min(100, simulation.blast_radius))
+  const tierClass = `blast-tier blast-tier-${simulation.risk_tier}`
+  return (
+    <section className="dry-run-panel" aria-label="Simulasi dry-run sebelum eksekusi">
+      <header>
+        <Gauge size={14} /> <strong>Simulasi Dry-Run · proyeksi beban</strong>
+        <span className={tierClass}>{simulation.risk_label}</span>
+      </header>
+      <p className="dry-run-note">
+        Estimasi sebelum eksekusi; tidak ada request yang dikirim. Lingkungan: {simulation.environment}
+        {simulation.job_count > 1 && ` · ${simulation.job_count} job`}.
+      </p>
+      <div className="dry-run-metrics">
+        <div className="dry-run-metric">
+          <Zap size={13} />
+          <b>{simulation.total_requests}</b>
+          <span>estimasi HTTP request</span>
+        </div>
+        <div className="dry-run-metric">
+          <Layers size={13} />
+          <b>{simulation.max_concurrency}</b>
+          <span>konkurensi maks</span>
+        </div>
+        <div className="dry-run-metric">
+          <Clock size={13} />
+          <b>~{simulation.estimated_seconds}s</b>
+          <span>perkiraan durasi</span>
+        </div>
+        <div className="dry-run-metric">
+          <Gauge size={13} />
+          <b>{score}/100</b>
+          <span>blast-radius · {blastRadiusLabel(score)}</span>
+        </div>
+      </div>
+      <div className="blast-meter" role="meter" aria-valuenow={score} aria-valuemin={0} aria-valuemax={100}>
+        <div className={`blast-meter-fill ${tierClass}`} style={{ width: `${score}%` }} />
+      </div>
+      {simulation.jobs.length > 1 && (
+        <ul className="dry-run-jobs">
+          {simulation.jobs.map((job, index) => (
+            <li key={index}>
+              <span>{job.tool || job.action}</span>
+              <small>
+                {job.estimated_requests} req · {job.target_addresses} alamat · blast {job.blast_radius}
+                {job.passive && ' · pasif'}
+              </small>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  )
+}
 
 function DiffLines({ diff }: { diff: string }): JSX.Element {
   return (
@@ -117,6 +174,7 @@ function ProposalCard({
       ) : (
         <DiffLines diff={proposal.diff} />
       )}
+      {proposal.simulation && !decided && <DryRunPanel simulation={proposal.simulation} />}
       {decided ? (
         <p className="proposal-state">
           {decided === 'applied'
@@ -157,11 +215,13 @@ function ProposalCard({
 export function ProposalReview({
   proposals,
   busy,
-  onDecide
+  onDecide,
+  simulation
 }: {
   proposals: Proposal[]
   busy: string
   onDecide: (id: string, approve: boolean, hunks?: number[]) => void
+  simulation?: PlanSimulation
 }): JSX.Element {
   const totals = reviewTotals(proposals)
   return (
@@ -172,6 +232,7 @@ export function ProposalReview({
         {totals.risky > 0 && ` · ${totals.risky} file perlu perhatian khusus`}. Tidak ada yang
         ditulis sebelum Anda menyetujui.
       </p>
+      {simulation && <DryRunPanel simulation={simulation} />}
       {proposals.map((proposal) => (
         <ProposalCard
           key={proposal.id}

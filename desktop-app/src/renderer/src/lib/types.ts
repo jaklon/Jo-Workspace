@@ -60,6 +60,7 @@ export interface Proposal {
     hunk_count: number
     risks: string[]
   }
+  simulation?: import('./policy').PlanSimulation
   state?: 'applied' | 'partial' | 'rejected'
   appliedHunks?: number[]
 }
