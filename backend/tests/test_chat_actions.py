@@ -41,6 +41,17 @@ class ChatActionTests(unittest.TestCase):
         self.assertIsNone(question)
         self.assertEqual(plan["ports"], [22, 443])
 
+    def test_unsupported_tool_reply_guides_the_user(self):
+        # A request the chat flow cannot turn into a check (e.g. "buatkan RoE")
+        # must name the supported checks, the needed parameters, and where to
+        # build an RoE manually — not just say the tool is unavailable.
+        plan, question = prepare_plan(SecuritySlots(tool="unsupported"))
+        self.assertIsNone(plan)
+        self.assertIn("http-head", question)
+        self.assertIn("document-review", question)
+        self.assertIn("Security Workspace", question)
+        self.assertIn("staging.example", question)
+
     def test_explicit_slots_never_invent_greybox_alias(self):
         slots = SecuritySlots(tool="document-review")
         complete_explicit_slots(slots, "GreyBox lab example.test configuration, alias akun uji")

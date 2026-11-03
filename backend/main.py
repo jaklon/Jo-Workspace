@@ -412,6 +412,14 @@ async def chat_endpoint(payload: ChatPayload, request: Request):
             yield wire(event("status", step="queued", label="Menunggu giliran model"))
             reasoning = True
             if payload.unified:
+                # A "deep analysis <url>" request returns the stored report, or the
+                # steps still needed. It must take priority over the router so it is
+                # never swallowed by web search or treated as a new scan.
+                deep = chat_report(request.app.state, payload.project_id, payload.prompt) if not payload.attachment_ids else None
+                if deep is not None:
+                    yield wire(event("result", result=deep, sources=[], coverage=None, images=[]))
+                    yield wire(event("done"))
+                    return
                 yield wire(event("status", step="routing", label="Menentukan jenis permintaan"))
                 router_model = payload.model_override or MODELS["reasoning"]
                 routed = await classify(payload.prompt, payload.history, router_model)
