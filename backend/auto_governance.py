@@ -72,7 +72,15 @@ def prepare_plan(slots):
     if slots.tool == "unsupported":
         if slots._va_constrained:
             return None, "Permintaan memuat pengecualian. Ulangi permintaan dengan tool yang ingin dijalankan, URL, lingkungan, dan mode agar rencana sesuai batas yang Anda inginkan."
-        return None, "Jenis atau kombinasi tool tersebut belum tersedia di alur chat. Sebutkan satu pemeriksaan yang didukung."
+        return None, (
+            "Alur chat menyiapkan satu pemeriksaan terbatas; RoE dan job dibuat otomatis "
+            "setelah Anda menyetujui kartu konfirmasi, jadi ia tidak membuat RoE kosong untuk "
+            "diedit manual (gunakan Security Workspace → Engagement untuk itu). Sebutkan "
+            "pemeriksaan yang didukung beserta URL atau target, lingkungan (lab, development, "
+            "staging, UAT, atau production read-only), dan mode (BlackBox, WhiteBox, atau GreyBox). "
+            "Pemeriksaan yang tersedia: " + ", ".join(TOOLS) + ". "
+            "Contoh: “VA https://staging.example staging blackbox” atau "
+            "“http-head https://staging.example staging blackbox”.")
     kind, action, duration, timeout = TOOLS[slots.tool]
     missing = []
     if not slots.target:

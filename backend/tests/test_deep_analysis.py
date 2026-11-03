@@ -104,6 +104,36 @@ class DeepAnalysisTests(unittest.TestCase):
         self.assertNotIn('tersedia dan aman',text);self.assertNotIn('diterapkan',text)
         self.assertIn('Laporan lama',text);self.assertIn('2 pernyataan',text);self.assertIn('Status 200.',text)
 
+    def test_unified_chat_deep_analysis_bypasses_router_and_returns_report(self):
+        # A "deep analysis <url>" message in unified chat must return the stored
+        # report, not be routed to web search or treated as a new scan.
+        job = self.client.post(self.url + '/jobs', headers=self.headers, json=self.plan()).json()
+        endpoint = self.url + '/deep-analysis'
+        payload = {'job_id': job['id'], 'model': 'local', 'actor_label': 'QA', 'acknowledge': True}
+        approved = self.client.post(self.url + '/jobs/' + job['id'] + '/approve', headers=self.headers,
+            json={'expected_revision': job['revision'], 'actor_label': 'QA', 'note': 'Review HEAD', 'acknowledge': True})
+        self.assertEqual(approved.status_code, 200, approved.text)
+        self.assertEqual(self.jobs.claim(self.owner), job['id'])
+        self.assertFalse(self.jobs.step(self.owner, job['id']))
+        synthetic = {'adapter': 'public-head-1.0', 'url': 'https://project.example/', 'method': 'HEAD',
+                     'requests': 1, 'http_status': 200, 'checks': [{'check': 'content-security-policy', 'status': 'missing'}]}
+        with patch('web_checks.probe', return_value=synthetic):
+            self.client.portal.call(self.client.app.state.web_runner.execute, self.owner, job['id'])
+        output = {'summary': 'Header tidak terlihat.', 'observations': ['CSP tidak terlihat pada HEAD.'],
+                  'limitations': ['Satu HEAD tidak membuktikan kerentanan.'], 'recommendations': ['Tinjau konfigurasi.']}
+        with patch('deep_analysis.installed_models', new=AsyncMock(return_value=[{'name': 'local', 'digest': 'abc'}])), \
+             patch('deep_analysis.runtime.chat', new=AsyncMock(return_value={'content': json.dumps(output), 'tool_calls': []})):
+            self.assertEqual(self.client.post(endpoint, headers=self.headers, json=payload).status_code, 201)
+        with patch('main.classify', new=AsyncMock(side_effect=AssertionError('router must not run for a deep-analysis request'))):
+            chat = self.client.post('/api/chat', headers=self.headers, json={
+                'prompt': 'deep analysis url https://project.example/', 'unified': True,
+                'web_mode': 'auto', 'project_id': self.project})
+        self.assertEqual(chat.status_code, 200, chat.text)
+        self.assertIn('Deep Analisis BlackBox', chat.text)
+        self.assertIn('https://project.example/', chat.text)
+        self.assertIn('Hasil memerlukan review manusia', chat.text)
+        self.assertNotIn('action_proposal', chat.text)
+
     def test_unknown_job_rejected_before_model(self):
         # A nonexistent job is rejected before any model call.
         from uuid import uuid4
