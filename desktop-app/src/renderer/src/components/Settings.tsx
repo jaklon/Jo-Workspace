@@ -113,6 +113,77 @@ function Toggle({
   )
 }
 
+const modelFeatureMeta: Record<
+  keyof ServerSettings['models'],
+  { title: string; description: string }
+> = {
+  reasoning: { title: 'Chat & dokumen', description: 'Penalaran umum untuk chat dan analisis dokumen.' },
+  coding: { title: 'Coding', description: 'Bantuan menulis dan meninjau kode.' },
+  security: { title: 'Security', description: 'Analisis keamanan dan pentest.' },
+  vision: {
+    title: 'Vision',
+    description: 'Harus mendukung gambar (mis. minicpm-v, llava, qwen2.5-vl).'
+  }
+}
+
+const CUSTOM_MODEL = '__custom__'
+
+/** Per-feature model picker: a dropdown of installed models, with an escape hatch
+ * to type a model name that is not installed yet. */
+function ModelSelect({
+  feature,
+  value,
+  installed,
+  onChange
+}: {
+  feature: keyof ServerSettings['models']
+  value: string
+  installed: string[]
+  onChange: (value: string) => void
+}): JSX.Element {
+  const [custom, setCustom] = useState(false)
+  const options = Array.from(new Set([...installed, value].filter(Boolean))).sort((a, b) =>
+    a.localeCompare(b)
+  )
+  if (custom) {
+    return (
+      <div className="model-select-custom">
+        <input
+          aria-label={`Model ${feature}`}
+          list="installed-models"
+          required
+          autoFocus
+          maxLength={120}
+          value={value}
+          placeholder="mis. qwen2.5:7b-instruct"
+          onChange={(e) => onChange(e.target.value)}
+        />
+        <button type="button" className="secondary-button" onClick={() => setCustom(false)}>
+          Pilih dari daftar
+        </button>
+      </div>
+    )
+  }
+  return (
+    <select
+      aria-label={`Model ${feature}`}
+      value={options.includes(value) ? value : CUSTOM_MODEL}
+      onChange={(e) => {
+        if (e.target.value === CUSTOM_MODEL) setCustom(true)
+        else onChange(e.target.value)
+      }}
+    >
+      {!options.length && <option value="">Tidak ada model terpasang</option>}
+      {options.map((m) => (
+        <option key={m} value={m}>
+          {m}
+        </option>
+      ))}
+      <option value={CUSTOM_MODEL}>Model lain (ketik manual)…</option>
+    </select>
+  )
+}
+
 export function Settings({
   preferences,
   setPreferences,
@@ -496,8 +567,10 @@ export function Settings({
                   }}
                 >
                   <p className="notice">
-                    Pilih model terpasang atau masukkan nama model Ollama. Model tidak diunduh
-                    otomatis. Simpan saat antrean kosong.
+                    Pilih model untuk setiap fitur dari daftar model terpasang
+                    {health ? ` (${health.installed_models.length} terpasang)` : ''}, atau pilih
+                    “Model lain” untuk mengetik nama model Ollama. Model tidak diunduh otomatis.
+                    Simpan saat antrean kosong.
                   </p>
                   <datalist id="installed-models">
                     {health?.installed_models.map((m) => (
@@ -508,29 +581,15 @@ export function Settings({
                     (key) => (
                       <Row
                         key={key}
-                        title={
-                          {
-                            reasoning: 'Chat & dokumen',
-                            coding: 'Coding',
-                            vision: 'Vision',
-                            security: 'Security'
-                          }[key]
-                        }
-                        description={
-                          key === 'vision' ? 'Gunakan model yang mendukung gambar.' : undefined
-                        }
+                        title={modelFeatureMeta[key].title}
+                        description={modelFeatureMeta[key].description}
                       >
-                        <input
-                          aria-label={`Model ${key}`}
-                          list="installed-models"
-                          required
-                          maxLength={120}
+                        <ModelSelect
+                          feature={key}
                           value={draft.models[key]}
-                          onChange={(e) =>
-                            setDraft({
-                              ...draft,
-                              models: { ...draft.models, [key]: e.target.value }
-                            })
+                          installed={health?.installed_models ?? []}
+                          onChange={(value) =>
+                            setDraft({ ...draft, models: { ...draft.models, [key]: value } })
                           }
                         />
                       </Row>

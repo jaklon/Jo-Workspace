@@ -9,10 +9,12 @@ from uuid import UUID,uuid4
 
 from fastapi import APIRouter,HTTPException,Request
 from pydantic import Field,StrictBool,model_validator
+import config
 from engagements import StrictModel,EngagementContent,utc_now
 from security_jobs import encode,digest,LEASE_SECONDS,ACTIVE
 from security_policy import evaluate,ScopeDriftError
 from security_evidence import SafeValidationRoute,EvidenceInput,redactor
+from mcp_contracts import ExternalMCPConfig
 from mcp_fixture_server import PROTOCOL,VERSION,TOOLS,FIXTURES,inspect_arguments
 from mcp_sandbox import SandboxRuntime,SandboxError,supported,exchange,sha_file
 
@@ -23,17 +25,49 @@ def descriptor():
             'source_hash':sha_file(Path(__file__).with_name('mcp_fixture_server.py')),'pentest_execution_enabled':False}
 
 
+def external_descriptor(cfg):
+    """Stable descriptor derived from an external server's config (secrets never
+    included). Clearly marked as running outside the AppContainer fixture sandbox."""
+    transport=cfg.get('transport') or {}
+    return {'adapter':cfg['adapter'],'server_name':cfg.get('name',''),'protocol':PROTOCOL,
+            'transport':{'kind':transport.get('transport'),'command':transport.get('command',''),
+                         'args':transport.get('args',[]),'env_keys':transport.get('env_keys',[]),'url':transport.get('url','')},
+            'allowed_tools':cfg.get('allowed_tools',[]),'authentication':'external_operator_managed',
+            'isolation':'external_no_appcontainer','pentest_execution_enabled':False}
+
+
+def descriptor_for(cfg):
+    return descriptor() if cfg.get('adapter','bundled_fixture')=='bundled_fixture' else external_descriptor(cfg)
+
+
 class ServerConfig(StrictModel):
     name:str=Field(min_length=1,max_length=120)
-    adapter:str=Field(default='bundled_fixture',pattern=r'^bundled_fixture$')
-    allowed_tools:list[str]=Field(min_length=1,max_length=2)
-    max_wall_seconds:int=Field(default=10,ge=1,le=15,strict=True)
+    adapter:str=Field(default='bundled_fixture',pattern=r'^(bundled_fixture|external_stdio|external_http)$')
+    allowed_tools:list[str]=Field(min_length=1,max_length=8)
+    max_wall_seconds:int=Field(default=10,ge=1,le=30,strict=True)
     max_output_kb:int=Field(default=32,ge=1,le=64,strict=True)
+    transport:ExternalMCPConfig|None=None
 
     @model_validator(mode='after')
-    def tools_known(self):
-        if len(set(self.allowed_tools))!=len(self.allowed_tools) or any(t not in {x['name'] for x in TOOLS} for t in self.allowed_tools):
-            raise ValueError('Only unique reviewed fixture tools are allowed.')
+    def consistent(self):
+        if self.adapter=='bundled_fixture':
+            if self.transport is not None:
+                raise ValueError('Adapter fixture tidak memakai transport eksternal.')
+            if len(self.allowed_tools)>2 or len(set(self.allowed_tools))!=len(self.allowed_tools) or any(t not in {x['name'] for x in TOOLS} for t in self.allowed_tools):
+                raise ValueError('Only unique reviewed fixture tools are allowed.')
+            if self.max_wall_seconds>15:
+                raise ValueError('Fixture dibatasi maksimal 15 detik.')
+        else:
+            # Gated opt-in: external servers are refused unless the operator turned them on.
+            if not config.EXTERNAL_MCP_ENABLED:
+                raise ValueError('Server MCP eksternal dinonaktifkan. Setel AGENT_ALLOW_EXTERNAL_MCP=1 (default aman: hanya fixture terisolasi).')
+            if self.transport is None:
+                raise ValueError('Server eksternal memerlukan konfigurasi transport.')
+            expected='external_stdio' if self.transport.transport=='stdio' else 'external_http'
+            if self.adapter!=expected:
+                raise ValueError('Adapter harus sesuai transport (stdio→external_stdio, http→external_http).')
+            if len(set(self.allowed_tools))!=len(self.allowed_tools) or any(not t.strip() or len(t)>120 for t in self.allowed_tools):
+                raise ValueError('Daftar tool eksternal harus unik dan valid.')
         return self
 
 
@@ -91,7 +125,7 @@ class MCPGateway:
         if revision is not None and row['revision']!=revision:raise HTTPException(409,'Revisi profil MCP berubah. Tinjau ulang.')
         if digest(json.loads(row['config']))!=row['config_hash'] or digest(json.loads(row['descriptor']))!=row['descriptor_hash']:
             raise HTTPException(409,'Integritas profil MCP tidak sesuai.')
-        if row['descriptor_hash']!=digest(descriptor()):raise HTTPException(409,'Adapter/schema/versi berubah. Buat profil baru dan tinjau ulang.')
+        if row['descriptor_hash']!=digest(descriptor_for(json.loads(row['config']))):raise HTTPException(409,'Adapter/schema/versi berubah. Buat profil baru dan tinjau ulang.')
         if approved and row['state']!='approved':raise HTTPException(423,'Server MCP belum disetujui atau dinonaktifkan.')
         return row
 
@@ -104,7 +138,7 @@ class MCPGateway:
             servers=[self.serialize(r) for r in db.execute('SELECT * FROM mcp_servers ORDER BY created_at DESC,id')]
         return {'servers':servers,'catalog':descriptor(),'descriptor_hash':digest(descriptor()),'runner_supported':supported(),
                 'limits':{'max_servers':20,'max_checks_per_server':100,'concurrency':1,'max_wall_seconds':15,'max_output_kb':64},
-                'external_servers_enabled':False,'pentest_execution_enabled':False,'authentication':'managed_local_stdio',
+                'external_servers_enabled':config.EXTERNAL_MCP_ENABLED,'pentest_execution_enabled':False,'authentication':'managed_local_stdio',
                 'approval_mode':'local_attestation'}
 
     def detail(self,sid):
@@ -117,7 +151,7 @@ class MCPGateway:
 
     def create(self,body):
         config=body.model_dump(mode='json');scrub,_=redactor();config['name']=scrub(config['name'])
-        sid,now=str(uuid4()),utc_now().isoformat();pin=descriptor()
+        sid,now=str(uuid4()),utc_now().isoformat();pin=descriptor_for(config)
         with self.engagements.transaction() as db:
             if db.execute('SELECT COUNT(*) FROM mcp_servers').fetchone()[0]>=20:raise HTTPException(409,'Batas 20 profil MCP tercapai.')
             db.execute("INSERT INTO mcp_servers VALUES (?,1,'draft',?,?,?,?,?,?,NULL)",(sid,encode(config),digest(config),encode(pin),digest(pin),now,now))
@@ -157,6 +191,8 @@ class MCPGateway:
         binding=plan['mcp']
         row=self.row(db,binding['server_id'],binding['server_revision'],approved=True)
         config=json.loads(row['config'])
+        if config.get('adapter','bundled_fixture')!='bundled_fixture':
+            raise HTTPException(422,'Hanya fixture terisolasi yang dapat dijalankan sebagai job. Server eksternal hanya untuk health-check/hot-reload.')
         if binding['descriptor_hash']!=row['descriptor_hash']:raise HTTPException(409,'Hash adapter MCP berubah.')
         if binding['tool'] not in config['allowed_tools']:raise HTTPException(403,'Tool MCP tidak diizinkan pada profil ini.')
         try:inspect_arguments(binding['tool'],binding['arguments'])
@@ -189,10 +225,35 @@ class MCPGateway:
         if tools!={'tools':TOOLS}:raise SandboxError('MCP tool catalog/schema mismatch.')
         return {'initialize':initialized,'tools_list':tools}
 
+    def _store_check(self,sid,revision,result):
+        with self.engagements.transaction() as db:
+            self.row(db,sid,revision,approved=True)
+            db.execute('INSERT INTO mcp_connection_checks VALUES (?,?,?,?,?)',(str(uuid4()),sid,revision,utc_now().isoformat(),encode(result)))
+            self.event(db,sid,revision,'connection_check','system',result['status'])
+        return result
+
+    async def external_health(self,sid,revision):
+        """Health-check an approved external MCP server via the bounded external runner
+        (NOT the AppContainer fixture sandbox). Records the result like a fixture check."""
+        with closing(self.engagements.connect()) as db:
+            row=self.row(db,sid,revision,approved=True)
+            server=json.loads(row['config'])
+        from mcp_external_runner import health_check
+        try:
+            result=await health_check(server['transport'],server['max_wall_seconds'],server['max_output_kb'])
+        except asyncio.CancelledError:raise
+        except Exception as exc:
+            result={'status':'failed','message':str(exc)[:300],'isolation':'external_no_appcontainer','tool_called':False}
+        result['adapter']=server['adapter']
+        return self._store_check(sid,revision,result)
+
     async def check(self,sid,revision):
         with closing(self.engagements.connect()) as db:
-            self.row(db,sid,revision,approved=True)
+            row=self.row(db,sid,revision,approved=True)
             if db.execute('SELECT COUNT(*) FROM mcp_connection_checks WHERE server_id=?',(sid,)).fetchone()[0]>=100:raise HTTPException(409,'Batas 100 pemeriksaan koneksi tercapai.')
+            external=json.loads(row['config']).get('adapter','bundled_fixture')!='bundled_fixture'
+        if external:
+            return await self.external_health(sid,revision)
         owner='check:'+str(uuid4());process=None;leased=False
         try:
             await asyncio.to_thread(self.runtime.prepare)
@@ -215,6 +276,20 @@ class MCPGateway:
             db.execute('INSERT INTO mcp_connection_checks VALUES (?,?,?,?,?)',(str(uuid4()),sid,revision,utc_now().isoformat(),encode(result)))
             self.event(db,sid,revision,'connection_check','system',result['status'])
         return result
+
+    async def reload(self,sid,body):
+        """Hot-reload: refresh a server's config/ENV and re-run its health check at
+        runtime without stopping FastAPI (servers are spawned per-use, not persistent)."""
+        with self.engagements.transaction() as db:
+            row=self.row(db,sid,body.expected_revision)
+            server=json.loads(row['config']);state=row['state']
+            external=server.get('adapter','bundled_fixture')!='bundled_fixture'
+            if external and not config.EXTERNAL_MCP_ENABLED:
+                raise HTTPException(409,'Server eksternal dinonaktifkan oleh kebijakan runtime; hot-reload tidak tersedia.')
+            self.event(db,sid,row['revision'],'reloaded','operator-lokal','Konfigurasi dimuat ulang saat runtime; proses FastAPI tidak dihentikan.')
+        if external and state=='approved':
+            return await self.external_health(sid,body.expected_revision)
+        return self.detail(sid)
 
     def attestation(self,pid):
         return {'backend':'windows_appcontainer','appcontainer_token_verified':True,'capabilities':[], 'network_allowed':False,
@@ -326,3 +401,7 @@ async def decide_server(server_id:UUID,body:ServerDecision,request:Request):retu
 
 @router.post('/servers/{server_id}/check')
 async def check_server(server_id:UUID,body:CheckServer,request:Request):return await request.app.state.mcp.check(str(server_id),body.expected_revision)
+
+
+@router.post('/servers/{server_id}/reload')
+async def reload_server(server_id:UUID,body:CheckServer,request:Request):return await request.app.state.mcp.reload(str(server_id),body)

@@ -28,3 +28,6 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 ALLOWED_ORIGINS = [x.strip() for x in os.getenv("AGENT_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173,null").split(",") if x.strip()]
 if "*" in ALLOWED_ORIGINS:
     raise ValueError("AGENT_ALLOWED_ORIGINS tidak boleh memakai wildcard '*'.")
+# External MCP servers are OFF by default; the isolated bundled fixture is the only
+# runner unless the operator deliberately opts in. See mcp_gateway/mcp_external_runner.
+EXTERNAL_MCP_ENABLED = os.getenv("AGENT_ALLOW_EXTERNAL_MCP", "") == "1"

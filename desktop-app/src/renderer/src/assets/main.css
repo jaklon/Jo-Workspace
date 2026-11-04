@@ -762,6 +762,16 @@ kbd {
 .setting-control select {
   max-width: 190px;
 }
+.model-select-custom {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.model-select-custom input {
+  flex: 1;
+  width: auto;
+  min-width: 0;
+}
 .field-block {
   display: flex;
   flex-direction: column;

@@ -58,6 +58,8 @@ export function MCPIntegrations({
   const [wall, setWall] = useState(10)
   const [output, setOutput] = useState(32)
   const [createdJob, setCreatedJob] = useState('')
+  const [transportText, setTransportText] = useState('')
+  const [toolsText, setToolsText] = useState('')
   useEffect(() => {
     const controller = new AbortController()
     void apiFetch('/api/security/mcp/servers', { signal: controller.signal })
@@ -99,6 +101,38 @@ export function MCPIntegrations({
     setError('')
   }
   const head = engagement.versions[0]
+  const externalEnabled = !!catalog?.external_servers_enabled
+  const latestHealth = (selected?.checks?.[0]?.result as { status?: string } | undefined)?.status
+  const defaultTransport = (kindTransport: 'stdio' | 'http'): string =>
+    JSON.stringify(
+      kindTransport === 'stdio'
+        ? { transport: 'stdio', command: '', args: [], env_keys: [] }
+        : { transport: 'http', url: 'https://' },
+      null,
+      2
+    )
+  const buildConfig = (): MCPConfig => {
+    if (config.adapter === 'bundled_fixture') return config
+    let transport: MCPConfig['transport']
+    try {
+      transport = JSON.parse(transportText)
+    } catch {
+      throw new Error('Konfigurasi transport bukan JSON yang valid.')
+    }
+    const tools = toolsText
+      .split(/[\n,]/)
+      .map((t) => t.trim())
+      .filter(Boolean)
+    if (!tools.length) throw new Error('Sebutkan minimal satu nama tool yang diizinkan.')
+    return {
+      name: config.name,
+      adapter: config.adapter,
+      allowed_tools: tools,
+      max_wall_seconds: config.max_wall_seconds,
+      max_output_kb: config.max_output_kb,
+      transport
+    }
+  }
   return (
     <section className="security-records" aria-label="MCP Integrations">
       <div className="section-title">
@@ -109,9 +143,9 @@ export function MCPIntegrations({
         <span className="planning-badge">Fixture terisolasi · pentest terkunci</span>
       </div>
       <p className="notice">
-        Hanya server fixture yang dibundel dan ditinjau dapat digunakan. Tidak ada URL, command,
-        environment, token eksternal, atau server MCP pihak ketiga yang dapat dijalankan. Model dan
-        pentest tetap dinonaktifkan.
+        {externalEnabled
+          ? 'Server MCP eksternal diaktifkan (AGENT_ALLOW_EXTERNAL_MCP=1). Server eksternal berjalan di luar AppContainer fixture dan hanya untuk health-check serta hot-reload — tidak dapat dieksekusi sebagai job. Tiap server tetap wajib ditinjau dan disetujui. Model dan pentest tetap dinonaktifkan.'
+          : 'Hanya server fixture yang dibundel dan ditinjau dapat digunakan. Server MCP eksternal dinonaktifkan secara default (setel AGENT_ALLOW_EXTERNAL_MCP=1 untuk mengaktifkan). Model dan pentest tetap dinonaktifkan.'}
       </p>
       <p className="muted-text">
         Windows AppContainer tanpa kapabilitas jaringan · satu proses · 256 MiB · CPU 3 detik ·
@@ -129,6 +163,8 @@ export function MCPIntegrations({
           disabled={busy || !catalog}
           onClick={() => {
             setConfig(defaultConfig())
+            setTransportText(defaultTransport('stdio'))
+            setToolsText('')
             setEditing(false)
             open('config')
           }}
@@ -195,7 +231,17 @@ export function MCPIntegrations({
         <article className="record-detail">
           <h4>{selected.config.name}</h4>
           <p>
-            {states[selected.state]} · {selected.id} · revisi {selected.revision}
+            {states[selected.state]} · {selected.config.adapter} · {selected.id} · revisi{' '}
+            {selected.revision}
+            {latestHealth && (
+              <>
+                {' '}
+                ·{' '}
+                <span className={latestHealth === 'passed' ? 'policy-pass' : 'policy-fail'}>
+                  koneksi: {latestHealth}
+                </span>
+              </>
+            )}
           </p>
           <p>
             Autentikasi transport: managed local stdio. Backend memiliki proses/handle fixture;
@@ -212,6 +258,12 @@ export function MCPIntegrations({
               disabled={busy}
               onClick={() => {
                 setConfig(selected.config)
+                setTransportText(
+                  selected.config.transport
+                    ? JSON.stringify(selected.config.transport, null, 2)
+                    : defaultTransport('stdio')
+                )
+                setToolsText(selected.config.allowed_tools.join(', '))
                 setEditing(true)
                 open('config')
               }}
@@ -228,7 +280,10 @@ export function MCPIntegrations({
               <>
                 <button
                   className="secondary-button"
-                  disabled={busy || !catalog?.runner_supported}
+                  disabled={
+                    busy ||
+                    (selected.config.adapter === 'bundled_fixture' && !catalog?.runner_supported)
+                  }
                   onClick={() =>
                     void operate(async () => {
                       await request('/servers/' + selected.id + '/check', {
@@ -240,6 +295,24 @@ export function MCPIntegrations({
                 >
                   Periksa koneksi MCP
                 </button>
+                {selected.config.adapter !== 'bundled_fixture' && (
+                  <button
+                    className="secondary-button"
+                    disabled={busy}
+                    onClick={() =>
+                      void operate(async () => {
+                        setSelected(
+                          await request('/servers/' + selected.id + '/reload', {
+                            expected_revision: selected.revision
+                          })
+                        )
+                      })
+                    }
+                  >
+                    <RefreshCw size={14} /> Hot-Reload
+                  </button>
+                )}
+                {selected.config.adapter === 'bundled_fixture' && (
                 <button
                   className="primary-button"
                   disabled={busy || !catalog?.runner_supported}
@@ -257,6 +330,7 @@ export function MCPIntegrations({
                 >
                   Rencana job fixture MCP
                 </button>
+                )}
                 <button className="danger-button" disabled={busy} onClick={() => open('disable')}>
                   Nonaktifkan server MCP
                 </button>
@@ -334,14 +408,15 @@ export function MCPIntegrations({
               e.preventDefault()
               void operate(async () => {
                 if (modal === 'config') {
+                  const payload = buildConfig()
                   setSelected(
                     editing && selected
                       ? await request(
                           '/servers/' + selected.id,
-                          { expected_revision: selected.revision, config },
+                          { expected_revision: selected.revision, config: payload },
                           'PUT'
                         )
-                      : await request('/servers', config)
+                      : await request('/servers', payload)
                   )
                 }
                 if ((modal === 'approve' || modal === 'disable') && selected)
@@ -402,8 +477,8 @@ export function MCPIntegrations({
             {modal === 'config' && (
               <>
                 <p>
-                  Adapter tetap bundled_fixture. Perubahan konfigurasi mencabut approval dan
-                  membatalkan semua job aktif yang terikat ke profil ini.
+                  Perubahan konfigurasi mencabut approval dan membatalkan semua job aktif yang
+                  terikat ke profil ini.
                 </p>
                 <Field label="Nama profil MCP">
                   <input
@@ -413,33 +488,80 @@ export function MCPIntegrations({
                     onChange={(e) => setConfig({ ...config, name: e.target.value })}
                   />
                 </Field>
-                <fieldset>
-                  <legend>Izin per tool MCP</legend>
-                  {mcpTools.map((t) => (
-                    <label className="checkbox-field" key={t}>
-                      <input
-                        type="checkbox"
-                        checked={config.allowed_tools.includes(t)}
-                        onChange={() =>
-                          setConfig({
-                            ...config,
-                            allowed_tools: config.allowed_tools.includes(t)
-                              ? config.allowed_tools.filter((x) => x !== t)
-                              : [...config.allowed_tools, t]
-                          })
-                        }
+                {externalEnabled && (
+                  <Field label="Adapter">
+                    <select
+                      value={config.adapter}
+                      onChange={(e) => {
+                        const adapter = e.target.value as MCPConfig['adapter']
+                        setConfig({
+                          ...config,
+                          adapter,
+                          allowed_tools:
+                            adapter === 'bundled_fixture' ? ['fixture.inspect'] : config.allowed_tools
+                        })
+                        if (adapter !== 'bundled_fixture')
+                          setTransportText(defaultTransport(adapter === 'external_http' ? 'http' : 'stdio'))
+                      }}
+                    >
+                      <option value="bundled_fixture">bundled_fixture (terisolasi)</option>
+                      <option value="external_stdio">external_stdio</option>
+                      <option value="external_http">external_http</option>
+                    </select>
+                  </Field>
+                )}
+                {config.adapter === 'bundled_fixture' ? (
+                  <fieldset>
+                    <legend>Izin per tool MCP</legend>
+                    {mcpTools.map((t) => (
+                      <label className="checkbox-field" key={t}>
+                        <input
+                          type="checkbox"
+                          checked={config.allowed_tools.includes(t)}
+                          onChange={() =>
+                            setConfig({
+                              ...config,
+                              allowed_tools: config.allowed_tools.includes(t)
+                                ? config.allowed_tools.filter((x) => x !== t)
+                                : [...config.allowed_tools, t]
+                            })
+                          }
+                        />
+                        {t}
+                      </label>
+                    ))}
+                  </fieldset>
+                ) : (
+                  <>
+                    <p className="notice">
+                      Server eksternal berjalan di luar AppContainer. Untuk stdio, isi command/args dan
+                      daftar <strong>nama</strong> ENV (bukan nilai rahasia) yang diteruskan dari
+                      environment backend. Untuk http, isi url loopback atau HTTPS tanpa kredensial.
+                    </p>
+                    <Field label="Konfigurasi transport (JSON)">
+                      <textarea
+                        rows={8}
+                        value={transportText}
+                        spellCheck={false}
+                        onChange={(e) => setTransportText(e.target.value)}
                       />
-                      {t}
-                    </label>
-                  ))}
-                </fieldset>
+                    </Field>
+                    <Field label="Tool yang diizinkan (pisahkan dengan koma)">
+                      <input
+                        value={toolsText}
+                        placeholder="repo.search, issues.list"
+                        onChange={(e) => setToolsText(e.target.value)}
+                      />
+                    </Field>
+                  </>
+                )}
                 <div className="record-filters">
                   <Field label="Batas waktu profil MCP (detik)">
                     <input
                       required
                       type="number"
                       min={1}
-                      max={15}
+                      max={config.adapter === 'bundled_fixture' ? 15 : 30}
                       value={config.max_wall_seconds}
                       onChange={(e) =>
                         setConfig({ ...config, max_wall_seconds: Number(e.target.value) })
@@ -595,7 +717,10 @@ export function MCPIntegrations({
                 disabled={
                   busy ||
                   ((modal === 'approve' || modal === 'disable') && !ack) ||
-                  (modal === 'config' && !config.allowed_tools.length)
+                  (modal === 'config' &&
+                    (config.adapter === 'bundled_fixture'
+                      ? !config.allowed_tools.length
+                      : !toolsText.trim()))
                 }
               >
                 {busy

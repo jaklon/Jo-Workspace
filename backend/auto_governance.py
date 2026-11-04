@@ -158,6 +158,12 @@ def adapter_plan(plan):
         from zap_adapter import image_hash
         from subfinder_adapter import fingerprint as subfinder_hash, amass_fingerprint
         fingerprint = image_hash() if tool == "zap-head" else subfinder_hash() if tool == "subfinder-passive" else amass_fingerprint()
+    elif tool in ("semgrep-sast", "bandit-sast"):
+        from sast_adapter import binary_hash
+        fingerprint = binary_hash(tool)
+    elif tool == "trivy-sca":
+        from sca_adapter import binary_hash
+        fingerprint = binary_hash()
     if fingerprint is None:
         raise ValueError("Tool atau image yang diminta tidak tersedia; tidak ada job yang dijalankan.")
     step = {"target": plan["target"], "action": plan["action"], "ports": [] if tool == "http-head" else plan["ports"],
@@ -181,7 +187,7 @@ def adapter_plan(plan):
 # authenticated review and fuzzing need an explicit confirmation backed by the
 # local session PIN. Unknown actions fail safe to the strictest tier.
 PASSIVE_ACTIONS = {"passive_recon", "configuration_review", "document_review", "monitoring_read"}
-MEDIUM_ACTIONS = {"tcp_discovery", "http_headers", "unauthenticated_access_check", "service_inventory"}
+MEDIUM_ACTIONS = {"tcp_discovery", "http_headers", "unauthenticated_access_check", "service_inventory", "source_review", "dependency_review"}
 HIGH_ACTIONS = {"scoped_spider", "active_reflection", "authenticated_api_review"}
 INTRUSIVE_TOOLS = {"nuclei-head", "zap-head", "scoped-spider", "active-reflection", "auth-two-session"}
 TIER_LABELS = {"low": "Low / pasif", "medium": "Medium", "high": "High / intrusif"}
