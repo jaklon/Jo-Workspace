@@ -21,7 +21,7 @@ from security_policy import evaluate, ScopeDriftError
 
 
 class ScanBinding(StrictModel):
-    tool: Literal['tcp-connect','nmap','monitoring-local','nuclei-head','zap-head','auth-unauthenticated-get','auth-two-session','inventory-html','js-bundle-inventory','scoped-spider','active-reflection','subfinder-passive','amass-passive']
+    tool: Literal['tcp-connect','nmap','monitoring-local','nuclei-head','zap-head','auth-unauthenticated-get','auth-two-session','inventory-html','js-bundle-inventory','scoped-spider','active-reflection','subfinder-passive','amass-passive','semgrep-sast','bandit-sast','trivy-sca']
     binary_sha256: str = Field(default='', max_length=64)
     provider_disclosure: StrictBool = False
     account_refs: list[str] = Field(default_factory=list, max_length=2)
@@ -60,6 +60,25 @@ def validate_scan(plan, check_binary=True):
     pointer=plan['scan'].get('owner_json_pointer','')
     if not valid_owner_pointer(pointer) or (pointer and plan['scan']['tool']!='auth-two-session'):
         raise ValueError('Pointer pemilik hanya untuk perbandingan dua sesi dan harus berupa JSON Pointer yang valid.')
+    if plan['scan']['tool'] in ('semgrep-sast','bandit-sast','trivy-sca'):
+        from engagements import repo_path
+        action='dependency_review' if plan['scan']['tool']=='trivy-sca' else 'source_review'
+        if step['target']['kind']!='repo' or step['action']!=action or step['ports']:
+            raise ValueError('SAST/SCA memerlukan target repo workspace, aksi lokal yang sesuai, dan tanpa port.')
+        repo_path(step['target']['value'])
+        if step['max_http_rps']!=1 or step['max_concurrency']!=1 or step['max_duration_minutes'] not in (1,2,3) or plan['wall_timeout_seconds']>120:
+            raise ValueError('Batas SAST/SCA tidak sesuai.')
+        if plan['scan'].get('provider_disclosure') or plan['scan'].get('account_refs') or plan['scan'].get('owner_json_pointer'):
+            raise ValueError('SAST/SCA tidak memakai disclosure, alias akun, atau pointer.')
+        if plan['scan']['tool']=='trivy-sca':
+            from sca_adapter import binary_hash as sca_hash
+            current=sca_hash() if check_binary else plan['scan']['binary_sha256']
+        else:
+            from sast_adapter import binary_hash as sast_hash
+            current=sast_hash(plan['scan']['tool']) if check_binary else plan['scan']['binary_sha256']
+        if not current or current!=plan['scan']['binary_sha256']:
+            raise ValueError('Executable SAST/SCA tidak tersedia atau berubah.')
+        return
     if plan['scan']['tool'] in ('subfinder-passive','amass-passive'):
         from subfinder_adapter import fingerprint,amass_fingerprint
         amass=plan['scan']['tool']=='amass-passive'
@@ -191,6 +210,12 @@ async def run_scan(plan, guard, exclusions=(), sessions=None, target_guard=None)
     if plan['scan']['tool']=='zap-head':
         from zap_adapter import run
         return await run(plan,guard,exclusions)
+    if plan['scan']['tool'] in ('semgrep-sast','bandit-sast'):
+        from sast_adapter import run as run_sast
+        return await run_sast(plan,guard)
+    if plan['scan']['tool']=='trivy-sca':
+        from sca_adapter import run as run_sca
+        return await run_sca(plan,guard)
     if plan['scan']['tool'] in ('subfinder-passive','amass-passive'):
         from subfinder_adapter import run
         return await run(plan,guard)
@@ -317,9 +342,12 @@ class ScanRunner:
                 row,plan=self.live(db,owner,jid)
                 _,head=self.jobs.engagements.head(db,row['project_id'],row['engagement_id'])
                 exclusions=EngagementContent.model_validate_json(head['content']).out_of_scope
-            from web_checks import drift_interceptor
-            await drift_interceptor(self.jobs.engagements,row['project_id'],row['engagement_id'],
-                                    plan['steps'][0]['target'],'scan:'+plan['scan']['tool'])
+            if plan['scan']['tool'] not in ('semgrep-sast','bandit-sast','trivy-sca'):
+                # Network scope-drift guard applies to network targets only; SAST/SCA
+                # are confined to the workspace by the adapter's path resolver instead.
+                from web_checks import drift_interceptor
+                await drift_interceptor(self.jobs.engagements,row['project_id'],row['engagement_id'],
+                                        plan['steps'][0]['target'],'scan:'+plan['scan']['tool'])
             sessions=self.jobs.sessions.take(jid) if plan['scan']['tool']=='auth-two-session' else None
             if plan['scan']['tool'] in ('scoped-spider','active-reflection','js-bundle-inventory'):
                 task=asyncio.create_task(run_scan(plan,guard,exclusions,target_guard=target_guard))

@@ -8,7 +8,10 @@ from urllib.parse import urlsplit, urlunsplit
 
 POLICY_VERSION = "scope-policy-2.0"
 NETWORK_ACTIONS = {"tcp_discovery", "http_headers", "unauthenticated_access_check", "service_inventory", "scoped_spider", "active_reflection", "authenticated_api_review", "monitoring_read", "passive_recon"}
-ALL_ACTIONS = NETWORK_ACTIONS | {"configuration_review", "document_review"}
+# Local, offline analysis of the approved workspace repository. Not network actions:
+# no ports/DNS/scope-drift. Safety comes from workspace-path containment at execution.
+LOCAL_CODE_ACTIONS = {"source_review", "dependency_review"}
+ALL_ACTIONS = NETWORK_ACTIONS | {"configuration_review", "document_review"} | LOCAL_CODE_ACTIONS
 BLOCKED = tuple(ipaddress.ip_network(n) for n in (
     "0.0.0.0/8", "169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4",
     "::/128", "::1/128", "::ffff:0:0/96", "64:ff9b::/96", "64:ff9b:1::/48",
@@ -152,12 +155,13 @@ def evaluate(content, head, engagement, proposal, now, dns_pinning=False):
     check("ACTIVE_WINDOW", content.starts_at is not None and content.ends_at is not None and content.starts_at <= now < content.ends_at, "Waktu server harus berada dalam jadwal RoE: awal inklusif, akhir eksklusif.")
     check("ACTION_ALLOWED", proposal.action in ALL_ACTIONS and proposal.action in content.allowed_actions, "Tindakan harus terdaftar secara eksplisit dalam RoE.")
     check("TARGET_SAFE", asset_problem(proposal.target, content.environment) is None, asset_problem(proposal.target, content.environment) or "Bentuk target dan kelas alamat memenuhi policy statis.")
-    check("IN_SCOPE", any(contains(asset, proposal.target) for asset in content.in_scope), "Seluruh target harus tercakup satu entri scope; domain exact-host, URL mengikuti scheme/port dan batas segmen path.")
+    check("IN_SCOPE", proposal.action in LOCAL_CODE_ACTIONS or any(contains(asset, proposal.target) for asset in content.in_scope), "Seluruh target harus tercakup satu entri scope; domain exact-host, URL mengikuti scheme/port dan batas segmen path. SAST/SCA dibatasi oleh workspace, bukan scope jaringan.")
     check("NOT_EXCLUDED", not any(overlaps(asset, proposal.target) for asset in content.out_of_scope), "Pengecualian selalu mengalahkan izin; CIDR atau target luas yang menyentuh pengecualian ditolak seluruhnya.")
     network_action = proposal.action in NETWORK_ACTIONS
     shape_ok = (proposal.action == "tcp_discovery" and proposal.target.kind in ("ip", "cidr", "domain")) or (proposal.action == 'monitoring_read' and proposal.target.kind == 'ip') or (proposal.action in ("http_headers", "unauthenticated_access_check", "service_inventory", "scoped_spider", "active_reflection", "authenticated_api_review") and proposal.target.kind == "url") or proposal.action in ("configuration_review", "document_review")
     shape_ok = shape_ok or (proposal.action=='passive_recon' and proposal.target.kind=='domain')
-    check("ACTION_TARGET_TYPE", shape_ok, "TCP memakai IP/CIDR/domain; HTTP/API memakai URL eksplisit; recon pasif memakai domain.")
+    shape_ok = shape_ok or (proposal.action in LOCAL_CODE_ACTIONS and proposal.target.kind == 'repo')
+    check("ACTION_TARGET_TYPE", shape_ok, "TCP memakai IP/CIDR/domain; HTTP/API memakai URL eksplisit; recon pasif memakai domain; SAST/SCA memakai path repo workspace.")
     ports = list(proposal.ports)
     if proposal.action in ("http_headers", "unauthenticated_access_check", "service_inventory", "scoped_spider", "active_reflection", "authenticated_api_review") and proposal.target.kind == "url":
         parsed = urlsplit(proposal.target.value)

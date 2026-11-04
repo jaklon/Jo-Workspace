@@ -8,13 +8,18 @@ from pathlib import Path
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
 from uuid import uuid4
 
+from fastapi import HTTPException
+from fastapi.testclient import TestClient
 import test_security_jobs as jobtests
+import config
 from engagements import utc_now
+from main import app
 from security_jobs import Approval,Stop,OfflineJobRunner,JobStore,digest
 from mcp_gateway import MCPGateway,ServerConfig,ServerDecision,descriptor
 from mcp_sandbox import SandboxRuntime,SandboxError,exchange,supported
@@ -293,6 +298,87 @@ class RealIsolationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             if parent.poll() is None:parent.kill();parent.wait(timeout=5)
             parent.stdout.close();parent.stderr.close()
+
+
+class ExternalMCPRegistryTests(unittest.TestCase):
+    """Gated external-MCP registry, hot-reload and health check. No AppContainer needed:
+    the external runner is separate from the fixture sandbox and is mocked here."""
+    def setUp(self):
+        self.legacy=patch('security.legacy_execution_blocked',return_value=False);self.legacy.start()
+        self.directory=tempfile.TemporaryDirectory(prefix='mcp-external-');self.data=Path(self.directory.name)
+        self.override=patch('main.DATA_DIR',self.data);self.override.start()
+        self.client=TestClient(app).__enter__()
+        self.headers={'Authorization':'Bearer '+os.environ['AGENT_API_TOKEN']}
+        self.gateway=self.client.app.state.mcp
+
+    def tearDown(self):
+        self.client.__exit__(None,None,None);self.override.stop();self.directory.cleanup();self.legacy.stop()
+
+    def create(self,**body):
+        return self.client.post('/api/security/mcp/servers',headers=self.headers,json=body)
+
+    def decide(self,row,action):
+        return self.client.post('/api/security/mcp/servers/'+row['id']+'/decisions',headers=self.headers,
+            json={'expected_revision':row['revision'],'action':action,'actor_label':'QA local','note':'Reviewed external server.','acknowledge':True})
+
+    def stdio_body(self,**changes):
+        return {'name':'GitHub MCP','adapter':'external_stdio','allowed_tools':['repo.search','issues.list'],
+                'max_wall_seconds':10,'max_output_kb':32,
+                'transport':{'transport':'stdio','command':'github-mcp-server','args':['--stdio'],'env_keys':['GITHUB_TOKEN']},**changes}
+
+    def test_gate_off_rejects_external_and_reports_disabled(self):
+        self.assertFalse(config.EXTERNAL_MCP_ENABLED)
+        self.assertFalse(self.client.get('/api/security/capabilities',headers=self.headers).json()['external_mcp_enabled'])
+        self.assertFalse(self.client.get('/api/security/mcp/servers',headers=self.headers).json()['external_servers_enabled'])
+        response=self.create(**self.stdio_body())
+        self.assertEqual(response.status_code,422,response.text)
+        # The fixture path still works with the gate off.
+        self.assertEqual(self.create(name='QA fixture',allowed_tools=['fixture.inspect']).status_code,201)
+
+    def test_gate_on_register_review_reload_health_and_disable(self):
+        with patch.object(config,'EXTERNAL_MCP_ENABLED',True):
+            self.assertTrue(self.client.get('/api/security/capabilities',headers=self.headers).json()['external_mcp_enabled'])
+            server=self.create(**self.stdio_body());self.assertEqual(server.status_code,201,server.text)
+            server=server.json();self.assertEqual(server['config']['adapter'],'external_stdio');self.assertEqual(server['state'],'draft')
+            # Secrets are never stored: only the ENV var name is kept.
+            self.assertEqual(server['config']['transport']['env_keys'],['GITHUB_TOKEN'])
+            self.assertNotIn('value',json.dumps(server['config']['transport']))
+            approved=self.decide(server,'approve');self.assertEqual(approved.status_code,200);approved=approved.json()
+            self.assertEqual(approved['state'],'approved')
+            health={'status':'passed','transport':'stdio','protocol':PROTOCOL,'server_info':{'name':'github'},'tools_count':2,'isolation':'external_no_appcontainer','tool_called':False}
+            with patch('mcp_external_runner.health_check',new=AsyncMock(return_value=health)) as probe:
+                checked=self.client.post('/api/security/mcp/servers/'+approved['id']+'/check',headers=self.headers,json={'expected_revision':approved['revision']})
+                self.assertEqual(checked.status_code,200,checked.text)
+                self.assertEqual(checked.json()['status'],'passed')
+                reloaded=self.client.post('/api/security/mcp/servers/'+approved['id']+'/reload',headers=self.headers,json={'expected_revision':approved['revision']})
+                self.assertEqual(reloaded.status_code,200,reloaded.text)
+                self.assertTrue(probe.await_count>=2)
+            detail=self.client.get('/api/security/mcp/servers/'+approved['id'],headers=self.headers).json()
+            self.assertTrue(any(e['action']=='reloaded' for e in detail['events']))
+            self.assertTrue(detail['checks'] and detail['checks'][0]['result']['isolation']=='external_no_appcontainer')
+            disabled=self.decide(approved,'disable');self.assertEqual(disabled.status_code,200)
+            self.assertEqual(disabled.json()['state'],'disabled')
+
+    def test_external_validation_rejects_shell_meta_and_bad_env(self):
+        with patch.object(config,'EXTERNAL_MCP_ENABLED',True):
+            self.assertEqual(self.create(**self.stdio_body(transport={'transport':'stdio','command':'sh -c "rm -rf /"','args':[],'env_keys':[]})).status_code,422)
+            self.assertEqual(self.create(**self.stdio_body(transport={'transport':'stdio','command':'x','args':['a&&b'],'env_keys':[]})).status_code,422)
+            self.assertEqual(self.create(**self.stdio_body(transport={'transport':'stdio','command':'x','args':[],'env_keys':['github_token']})).status_code,422)
+            self.assertEqual(self.create(**self.stdio_body(adapter='external_http',transport={'transport':'http','url':'http://evil.example/mcp'})).status_code,422)
+            self.assertEqual(self.create(**self.stdio_body(adapter='external_http',transport={'transport':'http','url':'https://user:pass@h/mcp'})).status_code,422)
+            ok=self.create(**self.stdio_body(adapter='external_http',name='HTTP MCP',transport={'transport':'http','url':'https://mcp.internal/mcp'}))
+            self.assertEqual(ok.status_code,201,ok.text)
+
+    def test_external_server_cannot_be_executed_as_job(self):
+        with patch.object(config,'EXTERNAL_MCP_ENABLED',True):
+            server=self.decide(self.create(**self.stdio_body()).json(),'approve').json()
+        plan={'mcp':{'server_id':server['id'],'server_revision':server['revision'],'descriptor_hash':server['descriptor_hash'],
+                     'tool':'fixture.inspect','arguments':{'fixture':'headers_missing'}},
+              'steps':[{'action':'configuration_review'}],'wall_timeout_seconds':10,'max_output_kb':32}
+        with self.gateway.engagements.transaction() as db:
+            with self.assertRaises(HTTPException) as caught:
+                self.gateway.validate(db,plan)
+        self.assertEqual(caught.exception.status_code,422)
 
 
 if __name__=='__main__':unittest.main()

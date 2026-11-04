@@ -1,9 +1,18 @@
+export type MCPAdapter = 'bundled_fixture' | 'external_stdio' | 'external_http'
+export interface MCPTransport {
+  transport: 'stdio' | 'http'
+  command?: string
+  args?: string[]
+  env_keys?: string[]
+  url?: string
+}
 export interface MCPConfig {
   name: string
-  adapter: string
+  adapter: MCPAdapter
   allowed_tools: string[]
   max_wall_seconds: number
   max_output_kb: number
+  transport?: MCPTransport | null
 }
 export interface MCPServer {
   id: string
@@ -30,7 +39,7 @@ export interface MCPCatalog {
   descriptor_hash: string
   runner_supported: boolean
   limits: { concurrency: number; max_wall_seconds: number; max_output_kb: number }
-  external_servers_enabled: false
+  external_servers_enabled: boolean
   pentest_execution_enabled: false
 }
 export interface MCPBinding {

@@ -18,7 +18,19 @@ from pydantic import StrictInt, StrictBool, AwareDatetime, BaseModel, ConfigDict
 from security_policy import POLICY_VERSION, scope_report, evaluate, enforce_scope_drift, ScopeDriftError
 
 FORBIDDEN = ["DoS/DDoS dan stress testing", "Penghapusan atau modifikasi data/skema", "Pengambilan PII asli", "Eksekusi shell arbitrer"]
-ACTIONS = ["tcp_discovery", "http_headers", "unauthenticated_access_check", "service_inventory", "scoped_spider", "active_reflection", "configuration_review", "document_review", "authenticated_api_review", "monitoring_read", "passive_recon"]
+ACTIONS = ["tcp_discovery", "http_headers", "unauthenticated_access_check", "service_inventory", "scoped_spider", "active_reflection", "configuration_review", "document_review", "authenticated_api_review", "monitoring_read", "passive_recon", "source_review", "dependency_review"]
+
+
+def repo_path(value):
+    """Normalize a workspace-relative repository path. No drive letters, no absolute
+    roots, no '..' traversal, no control characters; stored forward-slashed."""
+    cleaned = value.strip().replace("\\", "/")
+    if not cleaned or cleaned.startswith("/") or re.match(r"^[A-Za-z]:", cleaned):
+        raise ValueError("Path repo harus relatif terhadap workspace, bukan absolut.")
+    parts = [p for p in cleaned.split("/") if p not in ("", ".")]
+    if any(p == ".." for p in parts) or any(ord(c) < 32 for c in cleaned):
+        raise ValueError("Path repo tidak boleh memuat '..' atau karakter kontrol.")
+    return "/".join(parts) or "."
 
 
 def utc_now():
@@ -40,12 +52,16 @@ class StrictModel(BaseModel):
 
 
 class ScopeAsset(StrictModel):
-    kind: Literal["ip", "cidr", "domain", "url"]
+    kind: Literal["ip", "cidr", "domain", "url", "repo"]
     value: str = Field(min_length=1, max_length=1000)
 
     @model_validator(mode="after")
     def canonical(self):
         value = self.value
+        if self.kind == "repo":
+            # Repo paths may contain '/'; validate separately and skip the network grammar.
+            self.value = repo_path(value)
+            return self
         if any(c.isspace() or ord(c) < 32 for c in value):
             raise ValueError("Target tidak boleh mengandung spasi atau karakter kontrol.")
         try:
@@ -95,7 +111,7 @@ class EngagementContent(StrictModel):
     in_scope: list[ScopeAsset] = Field(default_factory=list, max_length=100)
     out_of_scope: list[ScopeAsset] = Field(default_factory=list, max_length=100)
     ports: list[StrictInt] = Field(default_factory=list, max_length=100)
-    allowed_actions: list[Literal["tcp_discovery", "http_headers", "unauthenticated_access_check", "service_inventory", "scoped_spider", "active_reflection", "configuration_review", "document_review", "authenticated_api_review", "monitoring_read", "passive_recon"]] = Field(default_factory=list, max_length=11)
+    allowed_actions: list[Literal["tcp_discovery", "http_headers", "unauthenticated_access_check", "service_inventory", "scoped_spider", "active_reflection", "configuration_review", "document_review", "authenticated_api_review", "monitoring_read", "passive_recon", "source_review", "dependency_review"]] = Field(default_factory=list, max_length=13)
     starts_at: AwareDatetime | None = None
     ends_at: AwareDatetime | None = None
     timezone: str = "Asia/Jakarta"
@@ -326,6 +342,25 @@ class EngagementStore:
             total = db.execute("SELECT COUNT(*) FROM scope_violations WHERE engagement_id=?", (eid,)).fetchone()[0]
         return {"items": rows, "total": total, "execution_enabled": False}
 
+    def scan_result_payloads(self, project_id, eid):
+        """Parsed completed scan/web result payloads for an engagement, for correlation."""
+        with closing(self.connect()) as db:
+            db.execute("BEGIN")
+            self.head(db, project_id, eid)
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "security_jobs" not in tables:
+                return []
+            payloads = []
+            for table in ("bounded_scan_results", "web_check_results"):
+                if table not in tables:
+                    continue
+                for row in db.execute(f"SELECT r.payload FROM {table} r JOIN security_jobs j ON r.job_id=j.id WHERE j.engagement_id=?", (eid,)):
+                    try:
+                        payloads.append(json.loads(row[0]))
+                    except (ValueError, TypeError):
+                        pass
+        return payloads
+
     def policy_history(self, project_id, eid, all_records=False):
         with closing(self.connect()) as db:
             db.execute("BEGIN")
@@ -435,7 +470,8 @@ async def project_retention(payload: ProjectRetention, request: Request):
 
 @router.get("/capabilities")
 async def capabilities():
-    return {"stage": 7, "agents_mode": "specialists_synthetic_lab_only", "agent_max_parallel": 1, "orchestration_mode": "single_local_model_fixture_only", "mcp_mode": "isolated_fixture_only", "external_mcp_enabled": False, "evidence_mode": "local_redacted_text", "findings_review": "local_attestation", "jobs_mode": "offline_policy_validation", "job_execution_enabled": False, "policy_version": POLICY_VERSION, "execution_enabled": False, "dns_resolution_enabled": False, "approval_mode": "local_attestation", "environments": ["lab", "development", "staging", "uat"], "allowed_actions": ACTIONS, "forbidden_actions": FORBIDDEN}
+    import config
+    return {"stage": 7, "agents_mode": "specialists_synthetic_lab_only", "agent_max_parallel": 1, "orchestration_mode": "single_local_model_fixture_only", "mcp_mode": "isolated_fixture_only" if not config.EXTERNAL_MCP_ENABLED else "fixture_plus_gated_external", "external_mcp_enabled": config.EXTERNAL_MCP_ENABLED, "evidence_mode": "local_redacted_text", "findings_review": "local_attestation", "jobs_mode": "offline_policy_validation", "job_execution_enabled": False, "policy_version": POLICY_VERSION, "execution_enabled": False, "dns_resolution_enabled": False, "approval_mode": "local_attestation", "environments": ["lab", "development", "staging", "uat"], "allowed_actions": ACTIONS, "forbidden_actions": FORBIDDEN}
 
 
 @router.post("/scope-validation")
@@ -481,6 +517,13 @@ async def policy_history(project_id: UUID, engagement_id: UUID, request: Request
 @router.get("/projects/{project_id}/engagements/{engagement_id}/scope-violations")
 async def scope_violations(project_id: UUID, engagement_id: UUID, request: Request):
     return request.app.state.engagements.scope_violations(str(project_id), str(engagement_id))
+
+
+@router.get("/projects/{project_id}/engagements/{engagement_id}/diagnostics")
+async def diagnostics(project_id: UUID, engagement_id: UUID, request: Request):
+    import finding_correlation
+    payloads = request.app.state.engagements.scan_result_payloads(str(project_id), str(engagement_id))
+    return finding_correlation.diagnostics(payloads)
 
 
 @router.post("/plan-simulation")

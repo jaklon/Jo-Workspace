@@ -11,7 +11,8 @@
   ],
   "activationEvents": [
     "onCommand:ai-agent.refactorCode",
-    "onCommand:ai-agent.configureConnection"
+    "onCommand:ai-agent.configureConnection",
+    "onCommand:ai-agent.loadSecurityDiagnostics"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -22,6 +23,16 @@
           "type": "string",
           "default": "http://127.0.0.1:8010",
           "description": "URL backend lokal atau HTTPS privat. Token disimpan di VS Code SecretStorage."
+        },
+        "ai-agent.projectId": {
+          "type": "string",
+          "default": "",
+          "description": "UUID project Security Workspace untuk diagnostik keamanan."
+        },
+        "ai-agent.engagementId": {
+          "type": "string",
+          "default": "",
+          "description": "UUID engagement Security Workspace untuk diagnostik keamanan."
         }
       }
     },
@@ -30,6 +41,10 @@
       {
         "command": "ai-agent.refactorCode",
         "title": "Jo Workspace: Review Selection"
+      },
+      {
+        "command": "ai-agent.loadSecurityDiagnostics",
+        "title": "Jo Workspace: Load Security Diagnostics"
       }
     ]
   },

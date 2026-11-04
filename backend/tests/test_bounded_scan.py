@@ -7,6 +7,7 @@ from unittest.mock import patch, AsyncMock
 
 import test_security_jobs as base
 from bounded_scan import validate_scan, run_scan
+import finding_correlation
 
 
 class ScanTests(base.JobApiTests):
@@ -292,3 +293,70 @@ class NmapArgsTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn('--script',args)
             self.assertNotIn('shell',launch.call_args.kwargs)
             self.assertEqual(result['ports'][0]['status'],'open')
+
+
+class SastScaValidateTests(unittest.TestCase):
+    """SAST/SCA plans are workspace-confined, offline, and bounded (no AppContainer)."""
+    def sast_plan(self, tool='bandit-sast', target='backend', action=None, **step_over):
+        action = action or ('dependency_review' if tool == 'trivy-sca' else 'source_review')
+        step = {'target': {'kind': 'repo', 'value': target}, 'action': action, 'ports': [],
+                'max_http_rps': 1, 'max_concurrency': 1, 'max_duration_minutes': 1, 'test_account_ref': ''}
+        step.update(step_over)
+        return {'steps': [step], 'wall_timeout_seconds': 60, 'web': None, 'mcp': None,
+                'scan': {'tool': tool, 'binary_sha256': 'a' * 64, 'provider_disclosure': False,
+                         'account_refs': [], 'owner_json_pointer': ''}}
+
+    def test_valid_sast_and_sca_plans_pass(self):
+        for tool in ('semgrep-sast', 'bandit-sast', 'trivy-sca'):
+            validate_scan(self.sast_plan(tool=tool), check_binary=False)  # no raise
+
+    def test_rejects_bad_action_ports_limits_and_traversal(self):
+        from engagements import repo_path
+        with self.assertRaises(ValueError):
+            validate_scan(self.sast_plan(tool='trivy-sca', action='source_review'), check_binary=False)
+        with self.assertRaises(ValueError):
+            validate_scan(self.sast_plan(ports=[443]), check_binary=False)
+        with self.assertRaises(ValueError):
+            validate_scan(self.sast_plan(max_duration_minutes=5), check_binary=False)
+        plan = self.sast_plan(); plan['wall_timeout_seconds'] = 200
+        with self.assertRaises(ValueError):
+            validate_scan(plan, check_binary=False)
+        plan = self.sast_plan(); plan['scan']['account_refs'] = ['x']
+        with self.assertRaises(ValueError):
+            validate_scan(plan, check_binary=False)
+        with self.assertRaises(ValueError):
+            repo_path('../etc/passwd')
+
+    def test_resolve_repo_path_confines_to_workspace(self):
+        import tempfile
+        from pathlib import Path
+        import config
+        from sast_adapter import resolve_repo_path
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'app').mkdir()
+            with patch.object(config, 'WORKSPACE_DIR', root):
+                result_root, target = resolve_repo_path('app')
+                self.assertEqual(target, (root / 'app').resolve())
+                with self.assertRaises(ValueError):
+                    resolve_repo_path('missing-subdir')
+
+
+class CorrelationTests(unittest.TestCase):
+    def test_dast_correlates_to_sast_and_never_fabricates(self):
+        results = [
+            {'tool': 'bandit-sast', 'findings': [{'tool': 'bandit-sast', 'rule_id': 'B-CSP', 'severity': 'medium',
+                'file': 'app/headers.py', 'line_start': 10, 'line_end': 10, 'message': 'missing content-security-policy'}]},
+            {'tool': 'trivy-sca', 'findings': [{'tool': 'trivy-sca', 'pkg': 'flask', 'installed_version': '1.0',
+                'fixed_version': '2.3.2', 'vuln_id': 'CVE-2023-1', 'severity': 'high', 'file': 'requirements.txt', 'title': 'x'}]},
+            {'tool': 'nuclei-head', 'target': 'https://app.test/login', 'csp_observation': 'missing_header_candidate'},
+            {'tool': 'zap-head', 'target': 'https://app.test/x', 'head': {'checks': [{'check': 'strict-transport-security', 'status': 'missing'}]}},
+        ]
+        out = finding_correlation.diagnostics(results)
+        self.assertEqual(out['counts'], {'dast': 2, 'sast': 1, 'sca': 1, 'diagnostics': len(out['diagnostics'])})
+        csp = [c for c in out['correlations'] if c['runtime'].get('header') == 'content-security-policy'][0]
+        self.assertEqual(csp['source']['file'], 'app/headers.py')
+        self.assertEqual(csp['confidence'], 'medium')
+        hsts = [c for c in out['correlations'] if c['runtime'].get('header') == 'strict-transport-security'][0]
+        self.assertIsNone(hsts['source'])
+        self.assertTrue(any(d['source_tool'] == 'trivy-sca' and d['file'] == 'requirements.txt' for d in out['diagnostics']))
